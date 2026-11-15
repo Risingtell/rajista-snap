@@ -1,16 +1,23 @@
 // Firebase: the app, App Check (required by Firebase AI Logic), and the AI Logic service.
-// The web config below is public by design; access is protected by App Check, not by hiding it.
+// The web config comes from .env (see .env.example). A Firebase web key is not a password: it ships in every
+// web page that uses Firebase. It is kept out of the repository anyway, and the live key is restricted to this
+// app's sites and to the Firebase APIs it uses; App Check then decides which requests reach the AI.
 import { initializeApp } from "firebase/app";
 import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-check";
 import { getAI, GoogleAIBackend } from "firebase/ai";
 
+const env = import.meta.env;
+const need = (k: string) => {
+  const v = env[k] as string | undefined;
+  if (!v) throw new Error(`${k} is not set. Copy .env.example to .env.local and fill it in (see README).`);
+  return v;
+};
+
 const app = initializeApp({
-  apiKey: "AIzaSyCsk-yVhTjdKMaeUFYt7X68XwRi4ttRGyQ",
-  authDomain: "rajista-ai.firebaseapp.com",
-  projectId: "rajista-ai",
-  storageBucket: "rajista-ai.firebasestorage.app",
-  messagingSenderId: "842188781934",
-  appId: "1:842188781934:web:a8abac4e909ac6bfb0697f",
+  apiKey: need("VITE_FIREBASE_API_KEY"),
+  authDomain: `${need("VITE_FIREBASE_PROJECT_ID")}.firebaseapp.com`,
+  projectId: need("VITE_FIREBASE_PROJECT_ID"),
+  appId: need("VITE_FIREBASE_APP_ID"),
 });
 
 // For local testing only: an App Check debug token from .env.local (never committed).
@@ -19,7 +26,7 @@ const debugToken = import.meta.env.VITE_APPCHECK_DEBUG_TOKEN as string | undefin
 if (debugToken) (self as unknown as { FIREBASE_APPCHECK_DEBUG_TOKEN: string }).FIREBASE_APPCHECK_DEBUG_TOKEN = debugToken;
 
 initializeAppCheck(app, {
-  provider: new ReCaptchaEnterpriseProvider("6LfKDxsuAAAAAN9t-sQHG6BMbix8F00hHZVI7pLW"),
+  provider: new ReCaptchaEnterpriseProvider(need("VITE_RECAPTCHA_SITE_KEY")),
   isTokenAutoRefreshEnabled: true,
 });
 
