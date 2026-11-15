@@ -35,7 +35,8 @@ export const INVOICE_JSON_SCHEMA = {
 
 export const READ_PROMPT =
   "This is a photo of a Nigerian shop invoice, receipt or delivery note. It may be handwritten. " +
-  "List every product line: quantity, the full product description (join a description that runs over several lines), " +
+  "List every product line: quantity, the product description copied exactly as written (join a description that runs over " +
+  "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
   "Also give the document total in naira (null if none), and the supplier: the business name printed at the top " +
   "of the paper (null if none). Numbers only, no commas or currency signs.";
