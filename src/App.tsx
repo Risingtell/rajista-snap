@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
 import { checkSums, type Invoice, type Line } from "./invoice";
+import { pickOnDevice } from "./devicematch";
 import { aliasKey, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
@@ -24,6 +25,8 @@ export function App() {
   const [choices, setChoices] = useState<Choice[]>([]);
   const [prices, setPrices] = useState<(number | null)[]>([]);
   const [saved, setSaved] = useState<string | null>(null);
+  // Lines the on-device model matched to a product (id), or "none" when it found no match.
+  const [devicePicks, setDevicePicks] = useState<(string | undefined)[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -38,6 +41,7 @@ export function App() {
     setChoices([]);
     setPrices([]);
     setSaved(null);
+    setDevicePicks([]);
   }
 
   async function getModel() {
@@ -93,11 +97,37 @@ export function App() {
     () => (invoice ? invoice.items.map((l) => matchLine(invoice.supplier, l.description, products)) : []),
     [invoice, products],
   );
+  // Lines the name matching was unsure about go to the on-device model, one at a time, privately.
+  useEffect(() => {
+    if (status !== "available" || !invoice || !products.length) return;
+    let stop = false;
+    (async () => {
+      for (let i = 0; i < matches.length && !stop; i++) {
+        if (matches[i].best || devicePicks[i] !== undefined) continue;
+        const pool = matches[i].others.length ? matches[i].others : products.length <= 15 ? products : [];
+        if (!pool.length) continue;
+        let pick: string = "none";
+        try {
+          pick = (await pickOnDevice(invoice.supplier, invoice.items[i].description, pool))?.id ?? "none";
+        } catch {
+          /* no on-device answer: the owner picks */
+        }
+        if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: pick }));
+      }
+    })();
+    return () => {
+      stop = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, status]);
+
   const resolved: (Product | null)[] = matches.map((m, i) => {
     const c = choices[i];
     if (c === "new") return null;
     if (c) return products.find((p) => p.id === c) ?? null;
-    return m.best?.product ?? null;
+    if (m.best) return m.best.product;
+    const d = devicePicks[i];
+    return d && d !== "none" ? products.find((p) => p.id === d) ?? null : null;
   });
   const withPrices = resolved.map((p, i) => (p ? { ...p, sellPrice: prices[i] ?? p.sellPrice } : null));
 
@@ -221,6 +251,7 @@ export function App() {
                         <MatchPicker
                           line={i}
                           suggestion={matches[i]}
+                          devicePick={devicePicks[i] && devicePicks[i] !== "none" ? products.find((p) => p.id === devicePicks[i]) : undefined}
                           choice={choices[i]}
                           products={products}
                           onPick={(c) => setChoices((cs) => Object.assign([...cs], { [i]: c }))}
@@ -285,23 +316,25 @@ export function App() {
 function MatchPicker({
   line,
   suggestion,
+  devicePick,
   choice,
   products,
   onPick,
 }: {
   line: number;
   suggestion: ReturnType<typeof matchLine>;
+  devicePick?: Product;
   choice: Choice;
   products: Product[];
   onPick: (c: Choice) => void;
 }) {
   if (!products.length) return <span className="match none">New product</span>;
-  const auto = suggestion.best;
+  const auto = suggestion.best ?? (devicePick ? { product: devicePick, score: 1, how: "device" as const } : null);
   const value = choice ?? (auto ? auto.product.id : "new");
-  const options = [...(auto ? [auto.product] : []), ...suggestion.others];
+  const options = [...(auto ? [auto.product] : []), ...suggestion.others.filter((p) => p !== auto?.product)];
   const rest = products.filter((p) => !options.includes(p));
   const label =
-    choice === undefined && auto ? (auto.how === "learned" ? "Known from this supplier" : "Looks like") : choice === "new" || (!choice && !auto) ? "New product" : "Your choice";
+    choice === undefined && auto ? (auto.how === "learned" ? "Known from this supplier" : auto.how === "device" ? "Matched on this device" : "Looks like") : choice === "new" || (!choice && !auto) ? "New product" : "Your choice";
   return (
     <label className={`match ${value === "new" ? "none" : auto && choice === undefined ? auto.how : "picked"}`}>
       <span>{label}</span>

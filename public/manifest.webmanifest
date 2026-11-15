@@ -1,0 +1,10 @@
+{
+  "name": "Rajista Snap",
+  "short_name": "Snap",
+  "description": "Photograph a supplier invoice, get a clean product list.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f4fb",
+  "theme_color": "#3a34a8",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
