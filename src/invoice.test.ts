@@ -60,7 +60,7 @@ describe("checkSums", () => {
 describe("normalize", () => {
   it("cleans numbers written as text and joins broken descriptions", () => {
     const inv = normalize({ items: [{ quantity: "3", description: " HP Laptop\n 14 ", unit_price: "₦595,000", line_total: "1,785,000" }], total: "N1,785,000" });
-    expect(inv).toEqual({ items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], total: 1785000 });
+    expect(inv).toEqual({ supplier: null, items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], total: 1785000 });
   });
 
   it("accepts a JSON string", () => {

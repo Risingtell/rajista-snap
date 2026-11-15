@@ -8,7 +8,7 @@ export type Line = {
   line_total: number | null; // naira
 };
 
-export type Invoice = { items: Line[]; total: number | null };
+export type Invoice = { supplier: string | null; items: Line[]; total: number | null };
 
 /** The JSON shape both readers are asked for. Written once so the device and the cloud get the same contract. */
 export const INVOICE_JSON_SCHEMA = {
@@ -28,15 +28,17 @@ export const INVOICE_JSON_SCHEMA = {
       },
     },
     total: { type: ["number", "null"] },
+    supplier: { type: ["string", "null"] },
   },
-  required: ["items", "total"],
+  required: ["supplier", "items", "total"],
 } as const;
 
 export const READ_PROMPT =
   "This is a photo of a Nigerian shop invoice, receipt or delivery note. It may be handwritten. " +
   "List every product line: quantity, the full product description (join a description that runs over several lines), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
-  "Also give the document total in naira (null if none). Numbers only, no commas or currency signs.";
+  "Also give the document total in naira (null if none), and the supplier: the business name printed at the top " +
+  "of the paper (null if none). Numbers only, no commas or currency signs.";
 
 const num = (v: unknown): number | null => {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -49,7 +51,7 @@ const num = (v: unknown): number | null => {
 
 /** Turns whatever a model returned into a clean Invoice, or throws if it is not one. */
 export function normalize(raw: unknown): Invoice {
-  const o = (typeof raw === "string" ? JSON.parse(raw) : raw) as { items?: unknown; total?: unknown } | null;
+  const o = (typeof raw === "string" ? JSON.parse(raw) : raw) as { items?: unknown; total?: unknown; supplier?: unknown } | null;
   if (!o || !Array.isArray(o.items)) throw new Error("The reader did not return a list of items.");
   const items: Line[] = o.items
     .map((it) => {
@@ -62,7 +64,8 @@ export function normalize(raw: unknown): Invoice {
       };
     })
     .filter((l) => l.description);
-  return { items, total: num(o.total) };
+  const supplier = typeof o.supplier === "string" && o.supplier.trim() ? o.supplier.replace(/\s+/g, " ").trim() : null;
+  return { supplier, items, total: num(o.total) };
 }
 
 export type Check = {
