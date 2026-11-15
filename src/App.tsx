@@ -4,6 +4,7 @@ import { preparePhoto, type Photo } from "./image";
 import { checkSums, type Invoice, type Line } from "./invoice";
 import { aliasKey, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
+import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
 
 const naira = (n: number | null) => (n === null ? "" : `₦${n.toLocaleString("en-NG")}`);
@@ -28,6 +29,7 @@ export function App() {
   useEffect(() => {
     deviceStatus().then(setStatus);
     listProducts().then(setProducts);
+    loadSettings();
   }, []);
 
   function show(r: Reading) {
@@ -419,7 +421,8 @@ function SourceBanner({ reading }: { reading: Reading }) {
   if (reading.source === "device")
     return (
       <div className="banner device">
-        <b>Read on this device</b> in {secs(reading.ms)}. The photo never left this computer. The prices were confirmed by the invoice total.
+        <b>Read on this device</b> in {secs(reading.ms)}. The photo never left this computer, and the prices were confirmed by the invoice total.
+        <span className="tokens"> Cost: ₦0.</span>
       </div>
     );
   return (
@@ -427,12 +430,7 @@ function SourceBanner({ reading }: { reading: Reading }) {
       <b>Read in the cloud</b> in {secs(reading.ms)}.{" "}
       {reading.device && <>The on-device try took {secs(reading.device.ms)}. </>}
       {reading.whyCloud}
-      {reading.tokens && (
-        <span className="tokens">
-          {" "}
-          {reading.tokens.prompt.toLocaleString()} tokens in, {reading.tokens.output.toLocaleString()} out.
-        </span>
-      )}
+      {reading.tokens && <CostNote tokens={reading.tokens} />}
       {reading.device?.invoice && (
         <details>
           <summary>What the device read</summary>
@@ -447,5 +445,16 @@ function SourceBanner({ reading }: { reading: Reading }) {
         </details>
       )}
     </div>
+  );
+}
+
+function CostNote({ tokens }: { tokens: { prompt: number; output: number } }) {
+  const c = cloudCost(tokens);
+  return (
+    <span className="tokens">
+      {" "}
+      {tokens.prompt.toLocaleString()} tokens in, {tokens.output.toLocaleString()} out: about ${c.usd.toFixed(4)} (₦{c.ngn.toFixed(2)}) at Google's paid rates,
+      free on this project's plan.
+    </span>
   );
 }
