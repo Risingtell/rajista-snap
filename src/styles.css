@@ -87,9 +87,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--brand-2); o
 .lines input { width: 100%; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; background: transparent; color: var(--text); }
 .lines input:hover { border-color: var(--line); }
 .lines input:focus { border-color: var(--brand-2); background: #fff; }
-.lines td:first-child { width: 64px; }
-.lines .money { text-align: right; font-variant-numeric: tabular-nums; min-width: 92px; }
-.lines td:nth-child(2) { min-width: 220px; }
+
+.lines .money { text-align: right; font-variant-numeric: tabular-nums; }
+.result .lines { table-layout: fixed; }
+.result .lines th:first-child { width: 56px; }
+.result .lines th.num { width: 108px; }
 
 .link { align-self: flex-start; background: none; border: 0; padding: 0; color: var(--brand); font-weight: 600; font-size: 14px; cursor: pointer; text-decoration: underline; }
 .link:disabled { opacity: .5; cursor: progress; }
