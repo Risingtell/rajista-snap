@@ -21,7 +21,7 @@ const deliveryNote = { items: [{ quantity: 1, description: 'Optoma SFP2075C17-D0
 
 describe("checkSums", () => {
   it("passes a correct read", () => {
-    expect(checkSums(normalize(cloudRising))).toEqual({ ok: true, problems: [], hasPrices: true });
+    expect(checkSums(normalize(cloudRising))).toEqual({ ok: true, problems: [], hasPrices: true, crossChecked: true });
   });
 
   it("catches the on-device misread of the Rising Technology receipt", () => {
@@ -30,12 +30,17 @@ describe("checkSums", () => {
     expect(c.problems).toEqual(["The lines add up to ₦233,500, but the invoice total says ₦236,500."]);
   });
 
-  it("passes a one-line invoice with only a line total", () => {
-    expect(checkSums(normalize(goodwill)).ok).toBe(true);
+  it("passes a one-line invoice whose line total matches the invoice total", () => {
+    expect(checkSums(normalize(goodwill))).toMatchObject({ ok: true, crossChecked: true });
+  });
+
+  it("does not trust a lone price with nothing to confirm it (the on-device read of the gas cooker invoice)", () => {
+    const deviceGoodwill = { items: [{ quantity: 1, description: "Maxi Stalling Gas cooker All gas burners", unit_price: 160000, line_total: 160000 }], total: null };
+    expect(checkSums(normalize(deviceGoodwill))).toMatchObject({ ok: true, crossChecked: false });
   });
 
   it("passes a delivery note with no prices, and says so", () => {
-    expect(checkSums(normalize(deliveryNote))).toEqual({ ok: true, problems: [], hasPrices: false });
+    expect(checkSums(normalize(deliveryNote))).toEqual({ ok: true, problems: [], hasPrices: false, crossChecked: true });
   });
 
   it("catches quantity times price that does not match the line total", () => {

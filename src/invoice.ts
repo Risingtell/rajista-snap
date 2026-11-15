@@ -70,6 +70,11 @@ export type Check = {
   /** One plain sentence per problem, shown to the shop owner when a read goes to the cloud. */
   problems: string[];
   hasPrices: boolean;
+  /**
+   * True only when another number on the page confirms the prices: every line has a total and the lines
+   * add up to the invoice total. A lone price cannot confirm itself. A paper with no prices is trivially true.
+   */
+  crossChecked: boolean;
 };
 
 const close = (a: number, b: number) => Math.abs(a - b) <= Math.max(1, Math.abs(b) * 0.001);
@@ -100,5 +105,7 @@ export function checkSums(inv: Invoice): Check {
   if (inv.total !== null && inv.items.length > 0 && !allTotals && inv.items.every((l) => l.line_total === null && l.unit_price === null)) {
     problems.push("There is a total but no line prices.");
   }
-  return { ok: problems.length === 0, problems, hasPrices };
+  const ok = problems.length === 0;
+  const crossChecked = !hasPrices || (ok && inv.total !== null && allTotals && inv.items.length > 0);
+  return { ok, problems, hasPrices, crossChecked };
 }

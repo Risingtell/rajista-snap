@@ -52,6 +52,20 @@ export function App() {
     }
   }
 
+  async function cloudInstead() {
+    if (!photo) return;
+    setError(null);
+    try {
+      const r = await readInvoice(photo, setStep, { forceCloud: true });
+      setReading(r);
+      setInvoice(r.invoice);
+    } catch (e) {
+      setError(`The cloud could not read this photo: ${(e as Error).message}`);
+    } finally {
+      setStep(null);
+    }
+  }
+
   function edit(i: number, patch: Partial<Line>) {
     if (!invoice) return;
     setInvoice({ ...invoice, items: invoice.items.map((l, k) => (k === i ? { ...l, ...patch } : l)) });
@@ -104,6 +118,11 @@ export function App() {
           {reading && invoice && check && (
             <div className="card result">
               <SourceBanner reading={reading} />
+              {reading.source === "device" && (
+                <button className="link" disabled={step !== null} onClick={cloudInstead}>
+                  Names look wrong? Read it again in the cloud
+                </button>
+              )}
               <table className="lines">
                 <thead>
                   <tr>

@@ -16,7 +16,7 @@ const DEVICE_TIMEOUT_MS = 90_000;
 const deviceModel = getGenerativeModel(ai, {
   mode: InferenceMode.ONLY_ON_DEVICE,
   onDeviceParams: {
-    createOptions: { expectedInputs: [{ type: "image" }] },
+    createOptions: { expectedInputs: [{ type: "image" }], expectedOutputs: [{ type: "text", languages: ["en"] }] },
     promptOptions: { responseConstraint: INVOICE_JSON_SCHEMA },
   },
 });
@@ -83,20 +83,24 @@ function parse(r: GenerateContentResult): Invoice {
   return normalize(r.response.text());
 }
 
-export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud") => void): Promise<Reading> {
+export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud") => void, opts: { forceCloud?: boolean } = {}): Promise<Reading> {
   let device: Attempt | undefined;
   let whyCloud: string;
-  const status = await deviceStatus();
+  const status = opts.forceCloud ? null : await deviceStatus();
 
-  if (status === "available") {
+  if (opts.forceCloud) {
+    whyCloud = "You asked for a cloud read.";
+  } else if (status === "available") {
     onStep("device");
     const t = performance.now();
     try {
       const invoice = parse(await withTimeout(ask(deviceModel, photo), DEVICE_TIMEOUT_MS));
       const check = checkSums(invoice);
       device = { ms: Math.round(performance.now() - t), invoice, check };
-      if (check.ok) return { invoice, check, source: "device", ms: device.ms, device };
-      whyCloud = `The on-device read did not add up: ${check.problems[0]}`;
+      if (check.ok && check.crossChecked) return { invoice, check, source: "device", ms: device.ms, device };
+      whyCloud = check.ok
+        ? "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it."
+        : `The on-device read did not add up: ${check.problems[0]}`;
     } catch (e) {
       device = { ms: Math.round(performance.now() - t), error: String((e as Error).message ?? e) };
       whyCloud = "The on-device model could not read this photo.";
