@@ -119,3 +119,25 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--brand-2); o
 .products .count { display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; background: var(--bg); color: var(--muted); font-size: 12px; }
 .products table { margin-top: 10px; }
 .match.device span { color: #0e7490; font-weight: 700; }
+
+/* Phones: each invoice line becomes a small card, product on top, numbers underneath with their labels. */
+@media (max-width: 640px) {
+  .result .lines, .result .lines tbody, .result .lines tfoot { display: block; }
+  .result .lines thead { display: none; }
+  .result .lines tbody tr {
+    display: grid; grid-template-columns: 44px 1fr 1fr 1fr; gap: 4px 4px;
+    padding: 10px 0; border-bottom: 1px solid var(--line);
+  }
+  .result .lines tbody td { display: flex; flex-direction: column; border: 0; padding: 0; min-width: 0; text-align: left; }
+  .result .lines tbody td.product { grid-column: 1 / -1; order: -1; }
+  .result .lines tbody td::before { content: attr(data-label); font-size: 11px; font-weight: 600; color: var(--muted); padding-left: 8px; }
+  .result .lines tbody td.product::before { display: none; }
+  .result .lines tbody td.product input { font-weight: 600; }
+  .result .lines .money { text-align: left; padding: 6px 4px; font-size: 15px; }
+  .result .lines tbody td::before { padding-left: 4px; }
+  .result .lines tfoot tr { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; }
+  .result .lines tfoot td { border: 0; padding: 0; }
+  .result .lines tfoot td:empty { display: none; }
+  .result .lines tfoot .money { text-align: right; max-width: 160px; }
+  .match { margin-left: 8px; flex-wrap: wrap; }
+}

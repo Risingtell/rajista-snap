@@ -34,7 +34,8 @@ export const INVOICE_JSON_SCHEMA = {
 } as const;
 
 export const READ_PROMPT =
-  "This is a photo of a Nigerian shop invoice, receipt or delivery note. It may be handwritten. " +
+  "This is a photo of a Nigerian shop invoice, receipt or delivery note. It may be handwritten, and the photo may be " +
+  "sideways or upside down: read it the right way up. " +
   "List every product line: quantity, the product description copied exactly as written (join a description that runs over " +
   "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +

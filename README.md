@@ -12,7 +12,7 @@ All AI calls go through **Firebase AI Logic**, protected by **App Check** (reCAP
 
 1. **Read on the device first.** If Chrome's built-in model (Gemini Nano) is available, Snap reads the photo on the device (`InferenceMode.ONLY_ON_DEVICE`, image input, JSON constrained to one schema).
 2. **Check the sums.** Every line must satisfy quantity × unit price = line total, and the lines must add up to the invoice total. A price is only trusted when another number on the page agrees with it (`src/invoice.ts`).
-3. **Send to the cloud only when needed.** If the device's read does not add up, or the device cannot read at all, the same photo goes to `gemini-3.5-flash-lite` (`InferenceMode.ONLY_IN_CLOUD`). The screen says which reader produced the result, how long it took, why it moved to the cloud, and what the cloud read would cost at Google's paid rates.
+3. **Send to the cloud only when needed.** If the device's read does not add up, or the device cannot read at all, the same photo goes to `gemini-3.5-flash-lite` (`InferenceMode.ONLY_IN_CLOUD`). If that read does not add up either, or the quick model is busy, `gemini-3.6-flash` reads it again; busy errors are retried twice first. The screen says which reader produced the result, how long it took, why it moved to the cloud, and what the cloud reads would cost at Google's paid rates.
 4. **Keep the private work on the device.** The shop's product list, selling prices and each supplier's shorthand live in the browser (IndexedDB) and are never uploaded. When plain name matching is unsure, the on-device model picks the matching product. That step has no cloud fallback, on purpose.
 
 What we measured on real invoices (14 to 15 November 2026, Chrome's on-device model on a 4-core CPU):
@@ -22,6 +22,7 @@ What we measured on real invoices (14 to 15 November 2026, Chrome's on-device mo
 | Printed wholesale invoice | Correct, sums cross-checked, 20 s | Kept on the device, cost ₦0 |
 | Handwritten receipt, 2 lines, ₦2,365,000 | Misread prices; the lines did not add up | Sent to the cloud: correct in 1.5 to 2.7 s |
 | Handwritten sales invoice, 1 line | Varied between runs; once read ₦160,000 for ₦140,000 with no total | Not trusted without a matching total; cloud read correct |
+| The same receipt photographed sideways (phone) | No on-device model on the phone | Cloud read correct in 2.4 s once the prompt allowed for rotated photos |
 
 Firebase **Remote Config** holds the cloud prices and the naira rate used by the cost counter, so they can change without a release.
 

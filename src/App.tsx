@@ -243,10 +243,10 @@ export function App() {
                 <tbody>
                   {invoice.items.map((l, i) => (
                     <tr key={i}>
-                      <td>
+                      <td data-label="Qty">
                         <input aria-label={`Quantity, line ${i + 1}`} inputMode="decimal" value={l.quantity} onChange={(e) => edit(i, { quantity: Number(e.target.value) || 0 })} />
                       </td>
-                      <td>
+                      <td data-label="Product" className="product">
                         <input aria-label={`Product, line ${i + 1}`} value={l.description} onChange={(e) => edit(i, { description: e.target.value })} />
                         <MatchPicker
                           line={i}
@@ -257,13 +257,13 @@ export function App() {
                           onPick={(c) => setChoices((cs) => Object.assign([...cs], { [i]: c }))}
                         />
                       </td>
-                      <td className="num">
+                      <td className="num" data-label="Unit cost">
                         <MoneyInput label={`Unit cost, line ${i + 1}`} value={l.unit_price} onChange={(v) => edit(i, { unit_price: v })} />
                       </td>
-                      <td className="num">
+                      <td className="num" data-label="Total">
                         <MoneyInput label={`Total, line ${i + 1}`} value={l.line_total} onChange={(v) => edit(i, { line_total: v })} />
                       </td>
-                      <td className="num">
+                      <td className="num" data-label="Your price">
                         <MoneyInput
                           label={`Your selling price, line ${i + 1}`}
                           value={prices[i] ?? resolved[i]?.sellPrice ?? null}
@@ -463,7 +463,8 @@ function SourceBanner({ reading }: { reading: Reading }) {
       <b>Read in the cloud</b> in {secs(reading.ms)}.{" "}
       {reading.device && <>The on-device try took {secs(reading.device.ms)}. </>}
       {reading.whyCloud}
-      {reading.tokens && <CostNote tokens={reading.tokens} />}
+      {reading.stepUp && <> {reading.stepUp}</>}
+      {reading.calls.length > 0 && <CostNote calls={reading.calls} />}
       {reading.device?.invoice && (
         <details>
           <summary>What the device read</summary>
@@ -481,13 +482,15 @@ function SourceBanner({ reading }: { reading: Reading }) {
   );
 }
 
-function CostNote({ tokens }: { tokens: { prompt: number; output: number } }) {
-  const c = cloudCost(tokens);
+function CostNote({ calls }: { calls: Reading["calls"] }) {
+  const c = cloudCost(calls);
+  const tin = calls.reduce((n, x) => n + x.prompt, 0), tout = calls.reduce((n, x) => n + x.output, 0);
   return (
     <span className="tokens">
       {" "}
-      {tokens.prompt.toLocaleString()} tokens in, {tokens.output.toLocaleString()} out: about ${c.usd.toFixed(4)} (₦{c.ngn.toFixed(2)}) at Google's paid rates,
-      free on this project's plan.
+      {calls.length > 1 ? `${calls.length} cloud reads, ` : ""}
+      {tin.toLocaleString()} tokens in, {tout.toLocaleString()} out: about ${c.usd.toFixed(4)} (₦{c.ngn.toFixed(2)}) at Google's paid rates, free on this
+      project's plan.
     </span>
   );
 }
