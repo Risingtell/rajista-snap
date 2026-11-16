@@ -1,8 +1,8 @@
 // Keeps Rajista Snap usable offline: the page and its files are cached on first visit. With no network,
 // the app still opens, the product list still works, and the on-device model can still read invoices.
-const CACHE = "snap-v1";
+const CACHE = "snap-v2";
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/", "/manifest.webmanifest", "/icon.svg"])));
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/", "/manifest.webmanifest", "/icon.svg", "/samples/alhaji-musa-1.jpg", "/samples/alhaji-musa-2.jpg", "/samples/alhaji-musa-3.jpg"])));
   self.skipWaiting();
 });
 self.addEventListener("activate", (e) => {

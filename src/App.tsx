@@ -204,6 +204,26 @@ export function App() {
         <button className="primary big" disabled={step !== null} onClick={() => fileRef.current?.click()}>
           {step ? "Reading…" : photo ? "Snap another invoice" : "Snap an invoice"}
         </button>
+        <div className="samples">
+          <span>No invoice to hand? Try one from Alhaji Musa Wholesale, three visits in November:</span>
+          {[
+            ["1", "3 Nov"],
+            ["2", "9 Nov"],
+            ["3", "15 Nov"],
+          ].map(([n, day]) => (
+            <button
+              key={n}
+              className="chip"
+              disabled={step !== null}
+              onClick={async () => {
+                const r = await fetch(`/samples/alhaji-musa-${n}.jpg`);
+                onFile(new File([await r.blob()], `alhaji-musa-${n}.jpg`, { type: "image/jpeg" }));
+              }}
+            >
+              Invoice {n} · {day}
+            </button>
+          ))}
+        </div>
         {step && (
           <p className="progress" role="status">
             {step === "device" ? "Reading on this device…" : "Reading in the cloud…"}

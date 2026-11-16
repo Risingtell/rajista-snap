@@ -160,6 +160,12 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
         const paperError = `${best.check.problems.join(" ")} Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.`;
         return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp, paperError };
       }
+      if (!best.check.ok && strong.check.ok && best.invoice.total !== strong.invoice.total && sameNumbers({ ...best.invoice, total: null }, { ...strong.invoice, total: null })) {
+        // Same lines, different totals: one reader may have "fixed" the paper's sum. Show the paper's figure and say so.
+        const naira = (n: number | null) => (n === null ? "none" : `₦${n.toLocaleString("en-NG")}`);
+        const paperError = `The two reads agree on every line but not on the total (${naira(best.invoice.total)} and ${naira(strong.invoice.total)}). The lines add up to ${naira(strong.invoice.total)}. Look at the total on the paper: if it says ${naira(best.invoice.total)}, the invoice itself is wrong. Check it with the supplier before you pay.`;
+        return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp, paperError };
+      }
       if (strong.check.ok || strong.check.problems.length < best.check.problems.length) {
         best = strong;
         model = STRONG_MODEL;

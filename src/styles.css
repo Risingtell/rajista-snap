@@ -142,3 +142,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--brand-2); o
   .match { margin-left: 8px; flex-wrap: wrap; }
 }
 .paper-error { border-radius: 12px; padding: 12px 14px; font-size: 14px; background: var(--amber-bg); color: #7c2d12; border: 1px solid #ecdcc0; }
+.samples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+.samples span { flex-basis: 100%; }
+.chip { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 999px; padding: 6px 12px; font-weight: 600; font-size: 13px; cursor: pointer; }
+.chip:hover { border-color: var(--brand-2); }
+.chip:disabled { opacity: .5; cursor: progress; }
