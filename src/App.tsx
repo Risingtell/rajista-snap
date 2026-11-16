@@ -1,17 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
-import { checkSums, type Invoice, type Line } from "./invoice";
+import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
 import { pickOnDevice } from "./devicematch";
 import { aliasKey, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
 
-const naira = (n: number | null) => (n === null ? "" : `₦${n.toLocaleString("en-NG")}`);
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 /** What the owner picked for a line: a product id, "new" for a new product, or undefined to accept Snap's match. */
 type Choice = string | "new" | undefined;
+
+/** The sample invoices on the first screen. Both suppliers are made up; the handwriting and receipt book are real. */
+const SAMPLES = [
+  { file: "alhaji-musa-1.jpg", label: "Invoice 1 · 3 Nov" },
+  { file: "alhaji-musa-2.jpg", label: "Invoice 2 · 9 Nov" },
+  { file: "alhaji-musa-3.jpg", label: "Invoice 3 · 15 Nov" },
+  { file: "printed-invoice.jpg", label: "Printed invoice · 12 Nov" },
+];
 
 export function App() {
   const [status, setStatus] = useState<DeviceStatus | null>(null);
@@ -27,6 +34,11 @@ export function App() {
   const [saved, setSaved] = useState<string | null>(null);
   // Lines the on-device model matched to a product (id), or "none" when it found no match.
   const [devicePicks, setDevicePicks] = useState<(string | undefined)[]>([]);
+  // One reading at a time: a second tap while one is running is ignored (busyRef is checked synchronously).
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // A sample invoice is matched against, and saved to, the sample products only, never the shop's real list.
+  const [fromSample, setFromSample] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -57,33 +69,69 @@ export function App() {
     }
   }
 
-  async function onFile(file: File | undefined) {
-    if (!file) return;
+  /** Runs one reading job at a time, with the busy flag and the error message handled in one place. */
+  async function exclusive(job: () => Promise<void>) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
     setError(null);
-    setReading(null);
-    setInvoice(null);
     try {
-      const p = await preparePhoto(file);
-      setPhoto(p);
-      show(await readInvoice(p, setStep));
-    } catch (e) {
-      setError(`Snap could not read this photo: ${(e as Error).message}`);
+      await job();
     } finally {
+      busyRef.current = false;
+      setBusy(false);
       setStep(null);
-      if (fileRef.current) fileRef.current.value = "";
     }
   }
 
-  async function cloudInstead() {
-    if (!photo) return;
-    setError(null);
+  async function readPhoto(blob: Blob, sample: boolean) {
+    setReading(null);
+    setInvoice(null);
+    let p: Photo;
     try {
-      show(await readInvoice(photo, setStep, { forceCloud: true }));
-    } catch (e) {
-      setError(`The cloud could not read this photo: ${(e as Error).message}`);
-    } finally {
-      setStep(null);
+      p = await preparePhoto(blob);
+    } catch {
+      setError("Snap could not open this photo. Please try another one.");
+      return;
     }
+    setPhoto(p);
+    setFromSample(sample);
+    try {
+      show(await readInvoice(p, setStep));
+    } catch (e) {
+      setError(`Snap could not read this photo: ${(e as Error).message}`);
+    }
+  }
+
+  function onFile(file: File | undefined) {
+    if (fileRef.current) fileRef.current.value = "";
+    if (file) exclusive(() => readPhoto(file, false));
+  }
+
+  function trySample(file: string) {
+    exclusive(async () => {
+      let blob: Blob;
+      try {
+        const r = await fetch(`/samples/${file}`);
+        if (!r.ok || !(r.headers.get("content-type") ?? "").startsWith("image/")) throw new Error(String(r.status));
+        blob = await r.blob();
+      } catch {
+        setError("The sample invoice could not be loaded. Check your connection and try again.");
+        return;
+      }
+      await readPhoto(blob, true);
+    });
+  }
+
+  function cloudInstead() {
+    if (!photo) return;
+    exclusive(async () => {
+      try {
+        show(await readInvoice(photo, setStep, { forceCloud: true }));
+      } catch (e) {
+        setError(`The cloud could not read this photo: ${(e as Error).message}`);
+      }
+    });
   }
 
   function edit(i: number, patch: Partial<Line>) {
@@ -92,23 +140,25 @@ export function App() {
     setSaved(null);
   }
 
+  // The products this invoice is matched against: the shop's own, or the sample ones for a sample invoice.
+  const pool = useMemo(() => products.filter((p) => !!p.demo === fromSample), [products, fromSample]);
   // Snap's suggestion for each line, from the private product list (src/match.ts).
   const matches = useMemo(
-    () => (invoice ? invoice.items.map((l) => matchLine(invoice.supplier, l.description, products)) : []),
-    [invoice, products],
+    () => (invoice ? invoice.items.map((l) => matchLine(invoice.supplier, l.description, pool)) : []),
+    [invoice, pool],
   );
   // Lines the name matching was unsure about go to the on-device model, one at a time, privately.
   useEffect(() => {
-    if (status !== "available" || !invoice || !products.length) return;
+    if (status !== "available" || !invoice || !pool.length) return;
     let stop = false;
     (async () => {
       for (let i = 0; i < matches.length && !stop; i++) {
         if (matches[i].best || devicePicks[i] !== undefined) continue;
-        const pool = matches[i].others.length ? matches[i].others : products.length <= 15 ? products : [];
-        if (!pool.length) continue;
+        const candidates = matches[i].others.length ? matches[i].others : pool.length <= 15 ? pool : [];
+        if (!candidates.length) continue;
         let pick: string = "none";
         try {
-          pick = (await pickOnDevice(invoice.supplier, invoice.items[i].description, pool))?.id ?? "none";
+          pick = (await pickOnDevice(invoice.supplier, invoice.items[i].description, candidates))?.id ?? "none";
         } catch {
           /* no on-device answer: the owner picks */
         }
@@ -141,7 +191,14 @@ export function App() {
       const picked = resolved[i];
       if (!picked) {
         const id = newId();
-        byId.set(id, { id, name: l.description, sellPrice: prices[i] ?? null, lastCost: cost, aliases: invoice.supplier ? [aliasKey(invoice.supplier, l.description)] : [] });
+        byId.set(id, {
+          id,
+          name: l.description,
+          sellPrice: prices[i] ?? null,
+          lastCost: cost,
+          aliases: invoice.supplier ? [aliasKey(invoice.supplier, l.description)] : [],
+          ...(fromSample ? { demo: true } : {}),
+        });
         added++;
         return;
       }
@@ -159,7 +216,9 @@ export function App() {
     setProducts(await listProducts());
     setChoices([]);
     setPrices([]);
-    setSaved(`Saved on this device: ${added} new product${added === 1 ? "" : "s"}, ${learned} new supplier name${learned === 1 ? "" : "s"} learned.`);
+    setSaved(
+      `Saved on this device${fromSample ? " (sample products, kept apart from your own)" : ""}: ${added} new product${added === 1 ? "" : "s"}, ${learned} new supplier name${learned === 1 ? "" : "s"} learned.`,
+    );
   }
 
   function downloadCsv() {
@@ -183,6 +242,8 @@ export function App() {
   }
 
   const check = invoice ? checkSums(invoice) : null;
+  /** What the other cloud read found for this number, when the two reads disagree on it. */
+  const other = (line: number | null, field: Dispute["field"]) => reading?.disputes?.find((d) => d.line === line && d.field === field);
 
   return (
     <div className="shell">
@@ -201,26 +262,14 @@ export function App() {
 
       <section className="card scan">
         <input ref={fileRef} id="photo" type="file" accept="image/*" capture="environment" hidden onChange={(e) => onFile(e.target.files?.[0])} />
-        <button className="primary big" disabled={step !== null} onClick={() => fileRef.current?.click()}>
-          {step ? "Reading…" : photo ? "Snap another invoice" : "Snap an invoice"}
+        <button className="primary big" disabled={busy} onClick={() => fileRef.current?.click()}>
+          {busy ? "Reading…" : photo ? "Snap another invoice" : "Snap an invoice"}
         </button>
         <div className="samples">
-          <span>No invoice to hand? Try one from Alhaji Musa Wholesale, three visits in November:</span>
-          {[
-            ["1", "3 Nov"],
-            ["2", "9 Nov"],
-            ["3", "15 Nov"],
-          ].map(([n, day]) => (
-            <button
-              key={n}
-              className="chip"
-              disabled={step !== null}
-              onClick={async () => {
-                const r = await fetch(`/samples/alhaji-musa-${n}.jpg`);
-                onFile(new File([await r.blob()], `alhaji-musa-${n}.jpg`, { type: "image/jpeg" }));
-              }}
-            >
-              Invoice {n} · {day}
+          <span>No invoice to hand? Try three handwritten visits to one wholesaler, or a printed invoice (both suppliers are made up):</span>
+          {SAMPLES.map((x) => (
+            <button key={x.file} className="chip" disabled={busy} onClick={() => trySample(x.file)}>
+              {x.label}
             </button>
           ))}
         </div>
@@ -241,13 +290,23 @@ export function App() {
           {reading && invoice && check && (
             <div className="card result">
               <SourceBanner reading={reading} />
-              {reading.paperError && (
-                <div className="paper-error" role="alert">
-                  <b>This invoice does not add up.</b> {reading.paperError}
+              {reading.paperError &&
+                (check.ok ? (
+                  <p className="private">You changed the numbers. As written, the paper did not add up.</p>
+                ) : (
+                  <div className="paper-error" role="alert">
+                    <b>This invoice does not add up.</b> {reading.paperError}
+                  </div>
+                ))}
+              {reading.disputes && (
+                <div className="disputes" role="status">
+                  <b>Check {reading.disputes.length === 1 ? "one number" : `${reading.disputes.length} numbers`} against the paper.</b> Two cloud reads
+                  disagreed, so they are marked in orange with the other read beside them.
+                  {reading.disputes.some((d) => d.field === "lines") && " They also found a different number of lines."}
                 </div>
               )}
               {reading.source === "device" && (
-                <button className="link" disabled={step !== null} onClick={cloudInstead}>
+                <button className="link" disabled={busy} onClick={cloudInstead}>
                   Names look wrong? Read it again in the cloud
                 </button>
               )}
@@ -269,24 +328,31 @@ export function App() {
                   {invoice.items.map((l, i) => (
                     <tr key={i}>
                       <td data-label="Qty">
-                        <input aria-label={`Quantity, line ${i + 1}`} inputMode="decimal" value={l.quantity} onChange={(e) => edit(i, { quantity: Number(e.target.value) || 0 })} />
+                        <input
+                          aria-label={`Quantity, line ${i + 1}`}
+                          className={other(i, "quantity") ? "disputed" : undefined}
+                          inputMode="decimal"
+                          value={l.quantity}
+                          onChange={(e) => edit(i, { quantity: Number(e.target.value) || 0 })}
+                        />
+                        <OtherRead d={other(i, "quantity")} plain />
                       </td>
                       <td data-label="Product" className="product">
                         <input aria-label={`Product, line ${i + 1}`} value={l.description} onChange={(e) => edit(i, { description: e.target.value })} />
                         <MatchPicker
                           line={i}
                           suggestion={matches[i]}
-                          devicePick={devicePicks[i] && devicePicks[i] !== "none" ? products.find((p) => p.id === devicePicks[i]) : undefined}
+                          devicePick={devicePicks[i] && devicePicks[i] !== "none" ? pool.find((p) => p.id === devicePicks[i]) : undefined}
                           choice={choices[i]}
-                          products={products}
+                          products={pool}
                           onPick={(c) => setChoices((cs) => Object.assign([...cs], { [i]: c }))}
                         />
                       </td>
                       <td className="num" data-label="Unit cost">
-                        <MoneyInput label={`Unit cost, line ${i + 1}`} value={l.unit_price} onChange={(v) => edit(i, { unit_price: v })} />
+                        <MoneyInput label={`Unit cost, line ${i + 1}`} value={l.unit_price} onChange={(v) => edit(i, { unit_price: v })} dispute={other(i, "unit_price")} />
                       </td>
                       <td className="num" data-label="Total">
-                        <MoneyInput label={`Total, line ${i + 1}`} value={l.line_total} onChange={(v) => edit(i, { line_total: v })} />
+                        <MoneyInput label={`Total, line ${i + 1}`} value={l.line_total} onChange={(v) => edit(i, { line_total: v })} dispute={other(i, "line_total")} />
                       </td>
                       <td className="num" data-label="Your price">
                         <MoneyInput
@@ -302,7 +368,7 @@ export function App() {
                   <tr>
                     <td colSpan={3}>Invoice total</td>
                     <td className="num">
-                      <MoneyInput label="Invoice total" value={invoice.total} onChange={(v) => setInvoice({ ...invoice, total: v })} />
+                      <MoneyInput label="Invoice total" value={invoice.total} onChange={(v) => setInvoice({ ...invoice, total: v })} dispute={other(null, "total")} />
                     </td>
                     <td />
                   </tr>
@@ -386,11 +452,30 @@ function MatchPicker({
 
 function ProductList({ products, onChange }: { products: Product[]; onChange: () => void }) {
   if (!products.length) return null;
+  const samples = products.filter((p) => p.demo);
   return (
     <details className="card products">
       <summary>
-        My products <span className="count">{products.length}</span>
+        {products.length > samples.length ? (
+          <>
+            My products <span className="count">{products.length - samples.length}</span>
+          </>
+        ) : (
+          "Sample products"
+        )}
+        {samples.length > 0 && <span className="count">{products.length > samples.length ? `+ ${samples.length} from the samples` : samples.length}</span>}
       </summary>
+      {samples.length > 0 && (
+        <button
+          className="link"
+          onClick={async () => {
+            for (const p of samples) await deleteProduct(p.id);
+            onChange();
+          }}
+        >
+          Remove the sample products
+        </button>
+      )}
       <table className="lines">
         <thead>
           <tr>
@@ -404,7 +489,10 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
         <tbody>
           {products.map((p) => (
             <tr key={p.id}>
-              <td>{p.name}</td>
+              <td>
+                {p.name}
+                {p.demo && <span className="tag">sample</span>}
+              </td>
               <td className="num">{naira(p.lastCost)}</td>
               <td className="num">
                 <MoneyInput
@@ -436,14 +524,21 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
   );
 }
 
-function MoneyInput({ label, value, onChange }: { label: string; value: number | null; onChange: (v: number | null) => void }) {
+/** The other cloud read's value for a disputed number, shown under the field. */
+function OtherRead({ d, plain }: { d?: Dispute; plain?: boolean }) {
+  if (!d) return null;
+  return <span className="other-read">other read: {d.other === null ? "blank" : plain ? d.other : naira(d.other)}</span>;
+}
+
+function MoneyInput({ label, value, onChange, dispute }: { label: string; value: number | null; onChange: (v: number | null) => void; dispute?: Dispute }) {
   const [text, setText] = useState(value === null ? "" : value.toLocaleString("en-NG"));
   useEffect(() => setText(value === null ? "" : value.toLocaleString("en-NG")), [value]);
   return (
-    <input
-      aria-label={label}
-      inputMode="numeric"
-      className="money"
+    <>
+      <input
+        aria-label={label}
+        inputMode="numeric"
+        className={dispute ? "money disputed" : "money"}
       value={text}
       placeholder="–"
       onChange={(e) => setText(e.target.value)}
@@ -452,7 +547,9 @@ function MoneyInput({ label, value, onChange }: { label: string; value: number |
         const v = text.trim() && Number.isFinite(n) ? n : null;
         if (v !== value) onChange(v);
       }}
-    />
+      />
+      <OtherRead d={dispute} />
+    </>
   );
 }
 

@@ -84,7 +84,8 @@ export type Check = {
 };
 
 const close = (a: number, b: number) => Math.abs(a - b) <= Math.max(1, Math.abs(b) * 0.001);
-const naira = (n: number) => `₦${n.toLocaleString("en-NG")}`;
+/** Naira as shop owners write it: ₦109,500. A missing amount shows as `none` (empty by default). */
+export const naira = (n: number | null, none = "") => (n === null ? none : `₦${n.toLocaleString("en-NG")}`);
 
 /**
  * Does the invoice add up? Quantity x unit price must equal each line total, and the lines must add up
@@ -116,11 +117,78 @@ export function checkSums(inv: Invoice): Check {
   return { ok, problems, hasPrices, crossChecked };
 }
 
-/** True when two reads found the same quantities and prices: then a failed sum check is the paper's own error. */
-export function sameNumbers(a: Invoice, b: Invoice): boolean {
-  if (a.items.length !== b.items.length || a.total !== b.total) return false;
-  return a.items.every((l, i) => {
-    const m = b.items[i];
-    return l.quantity === m.quantity && l.unit_price === m.unit_price && l.line_total === m.line_total;
-  });
+/** True when two reads found the same lines: the same number of lines, with the same quantities and prices. */
+export function sameLines(a: Invoice, b: Invoice): boolean {
+  return (
+    a.items.length === b.items.length &&
+    a.items.every((l, i) => {
+      const m = b.items[i];
+      return l.quantity === m.quantity && l.unit_price === m.unit_price && l.line_total === m.line_total;
+    })
+  );
+}
+
+/** True when two reads found every number the same, the invoice total included. */
+export const sameNumbers = (a: Invoice, b: Invoice) => a.total === b.total && sameLines(a, b);
+
+/** One number two reads disagree on. `line` is the line's index, or null for the invoice total or the line count. */
+export type Dispute = {
+  line: number | null;
+  field: "quantity" | "unit_price" | "line_total" | "total" | "lines";
+  shown: number | null;
+  other: number | null;
+};
+
+/** Every number on which the read being shown differs from the other read. */
+export function disputes(shown: Invoice, other: Invoice): Dispute[] {
+  const out: Dispute[] = [];
+  if (shown.items.length !== other.items.length) {
+    out.push({ line: null, field: "lines", shown: shown.items.length, other: other.items.length });
+  } else {
+    shown.items.forEach((l, i) => {
+      const m = other.items[i];
+      for (const field of ["quantity", "unit_price", "line_total"] as const) {
+        if (l[field] !== m[field]) out.push({ line: i, field, shown: l[field], other: m[field] });
+      }
+    });
+  }
+  if (shown.total !== other.total) out.push({ line: null, field: "total", shown: shown.total, other: other.total });
+  return out;
+}
+
+export type Reconciled = {
+  invoice: Invoice;
+  from: "first" | "second";
+  /** Only when both reads found exactly the same numbers and those numbers do not add up. */
+  paperError?: string;
+  /** The numbers the two reads disagree on, for the owner to check against the paper. */
+  disputes: Dispute[];
+};
+
+/**
+ * Combines a first read that did not add up with a second read of the same photo.
+ *
+ * - Same numbers in both: both readers saw the same thing, so if it does not add up, the paper itself is wrong.
+ *   The second (stronger) read's names and supplier are kept, with the shared numbers.
+ * - Different numbers: neither read is confirmed. Show the one that adds up (or has fewer problems), and list
+ *   every number they disagree on. Never claim the paper is wrong here: one reader may simply have misread it,
+ *   or may have "corrected" the paper's arithmetic.
+ */
+export function reconcile(first: Invoice, second: Invoice): Reconciled {
+  const a = checkSums(first);
+  const b = checkSums(second);
+  if (sameNumbers(first, second)) {
+    return {
+      invoice: { ...second, supplier: second.supplier ?? first.supplier },
+      from: "second",
+      disputes: [],
+      paperError: a.ok
+        ? undefined
+        : `${a.problems.join(" ")} Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.`,
+    };
+  }
+  const useSecond = b.ok || (!a.ok && b.problems.length <= a.problems.length);
+  const shown = useSecond ? second : first;
+  const other = useSecond ? first : second;
+  return { invoice: { ...shown, supplier: shown.supplier ?? other.supplier }, from: useSecond ? "second" : "first", disputes: disputes(shown, other) };
 }

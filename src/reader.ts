@@ -1,21 +1,24 @@
 // The hybrid reader. Every AI call goes through Firebase AI Logic.
 //
 //   1. If this browser has the on-device model, read the photo on the device.
-//   2. Check the sums (src/invoice.ts). If they add up, keep the on-device read.
-//   3. If they don't, or the device cannot read at all, send the photo to the cloud model.
+//   2. Check the sums (src/invoice.ts). Keep the on-device read only if another number on the page confirms it.
+//   3. Otherwise send the photo to the quick cloud model. If that read does not add up either, the stronger cloud
+//      model reads it again, and the two reads are reconciled (src/invoice.ts): the same numbers twice means the
+//      paper itself is wrong; different numbers are shown to the owner to check.
 //
 // The shop owner sees which reader produced each invoice and why it moved to the cloud.
 import { getGenerativeModel, InferenceMode, type GenerateContentResult } from "firebase/ai";
 import { ai } from "./firebase";
-import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, sameNumbers, type Check, type Invoice } from "./invoice";
+import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, reconcile, type Check, type Dispute, type Invoice } from "./invoice";
 import type { Photo } from "./image";
 
 export const CLOUD_MODEL = "gemini-3.5-flash-lite";
 /** A stronger cloud model, used only when the first cloud read does not add up (a sideways or faint photo). */
 export const STRONG_MODEL = "gemini-3.6-flash";
+/** Time limits, each covering a reader's retries too. A call still running at its limit is cancelled. */
 const DEVICE_TIMEOUT_MS = 90_000;
-const STRONG_TIMEOUT_MS = 45_000;
-const CLOUD_TIMEOUT_MS = 40_000;
+const QUICK_TIMEOUT_MS = 50_000;
+const STRONG_TIMEOUT_MS = 50_000;
 
 const deviceModel = getGenerativeModel(ai, {
   mode: InferenceMode.ONLY_ON_DEVICE,
@@ -78,19 +81,34 @@ export type Reading = {
   calls: { model: string; prompt: number; output: number }[];
   model?: string; // the cloud model whose read is shown
   stepUp?: string; // why the stronger model was used, when it was
-  /** Set when two separate reads found the same numbers and they still do not add up: the paper itself is wrong. */
+  /** Only when two separate reads found exactly the same numbers and they do not add up: the paper itself is wrong. */
   paperError?: string;
+  /** Numbers the two cloud reads disagree on, for the owner to check against the paper. */
+  disputes?: Dispute[];
 };
 
-const withTimeout = <T,>(p: Promise<T>, ms: number) =>
-  Promise.race([p, new Promise<never>((_, no) => setTimeout(() => no(new Error(`no answer after ${ms / 1000} s`)), ms))]);
+/** Runs `fn` with a signal that is aborted after `ms`; rejects with a plain message then. The timer is always cleared. */
+function timed<T>(fn: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, no) => {
+    timer = setTimeout(() => {
+      ctl.abort();
+      no(new Error(`no answer after ${ms / 1000} s`));
+    }, ms);
+  });
+  return Promise.race([fn(ctl.signal), limit]).finally(() => clearTimeout(timer));
+}
 
-const ask = (model: typeof cloudModel, photo: Photo) =>
-  model.generateContent([READ_PROMPT, { type: "inlineData", inlineData: { data: photo.base64, mimeType: photo.mimeType } }]);
+const ask = (model: typeof cloudModel, photo: Photo, signal: AbortSignal) =>
+  model.generateContent([READ_PROMPT, { type: "inlineData", inlineData: { data: photo.base64, mimeType: photo.mimeType } }], { signal });
 
 function parse(r: GenerateContentResult): Invoice {
   return normalize(r.response.text());
 }
+
+const message = (e: unknown) => String((e as Error)?.message ?? e);
+const refusedByAppCheck = (e: unknown) => /app ?check|\[40[13]\b/i.test(message(e));
 
 export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud") => void, opts: { forceCloud?: boolean } = {}): Promise<Reading> {
   let device: Attempt | undefined;
@@ -103,7 +121,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     onStep("device");
     const t = performance.now();
     try {
-      const invoice = parse(await withTimeout(ask(deviceModel, photo), DEVICE_TIMEOUT_MS));
+      const invoice = parse(await timed((signal) => ask(deviceModel, photo, signal), DEVICE_TIMEOUT_MS));
       const check = checkSums(invoice);
       device = { ms: Math.round(performance.now() - t), invoice, check };
       if (check.ok && check.crossChecked) return { invoice, check, source: "device", ms: device.ms, device, calls: [] };
@@ -111,7 +129,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
         ? "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it."
         : `The on-device read did not add up: ${check.problems[0]}`;
     } catch (e) {
-      device = { ms: Math.round(performance.now() - t), error: String((e as Error).message ?? e) };
+      device = { ms: Math.round(performance.now() - t), error: message(e) };
       whyCloud = "The on-device model could not read this photo.";
     }
   } else {
@@ -121,71 +139,79 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
   onStep("cloud");
   const t = performance.now();
   const calls: Reading["calls"] = [];
-  const cloudRead = async (model: typeof cloudModel, name: string) => {
-    const r = await withRetry(() => withTimeout(ask(model, photo), CLOUD_TIMEOUT_MS));
-    const u = r.response.usageMetadata;
-    if (u) calls.push({ model: name, prompt: u.promptTokenCount, output: u.candidatesTokenCount + (u.thoughtsTokenCount ?? 0) });
-    const invoice = parse(r);
-    return { invoice, check: checkSums(invoice) };
-  };
-
-  let best: { invoice: Invoice; check: Check };
+  let finished = false; // a cancelled call that answers late must not change a reading already shown
   let model = CLOUD_MODEL;
   let stepUp: string | undefined;
+
+  const cloudRead = (m: typeof cloudModel, name: string, ms: number) =>
+    timed(async (signal) => {
+      const r = await withRetry(() => ask(m, photo, signal), signal);
+      const u = r.response.usageMetadata;
+      if (u && !finished) calls.push({ model: name, prompt: u.promptTokenCount, output: u.candidatesTokenCount + (u.thoughtsTokenCount ?? 0) });
+      return parse(r);
+    }, ms);
+
+  const finish = (invoice: Invoice, extra: Partial<Reading> = {}): Reading => {
+    finished = true;
+    return { invoice, check: checkSums(invoice), source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls: [...calls], model, stepUp, ...extra };
+  };
+
+  let first: Invoice;
   try {
-    best = await cloudRead(cloudModel, CLOUD_MODEL);
+    first = await cloudRead(cloudModel, CLOUD_MODEL, QUICK_TIMEOUT_MS);
   } catch (e) {
-    // The quick model is overloaded or down: the stronger model reads it instead.
+    if (refusedByAppCheck(e)) {
+      throw new Error(
+        "Google's security check did not accept this browser, so the AI would not read the photo. Reload the page and try again. If it keeps happening, try another browser or come back later.",
+      );
+    }
+    // The quick model is busy or down: the stronger model reads it instead.
     stepUp = "The quick cloud model was busy, so a stronger model read it.";
-    onStep("cloud");
-    best = await withTimeout(cloudRead(strongModel, STRONG_MODEL), STRONG_TIMEOUT_MS).catch(() => {
-      throw new Error(`Google's AI is busy right now (${String((e as Error).message ?? e).slice(0, 80)}). Please try again in a minute.`);
-    });
     model = STRONG_MODEL;
-    return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp };
+    onStep("cloud");
+    let strong: Invoice;
+    try {
+      strong = await cloudRead(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
+    } catch {
+      finished = true;
+      throw new Error("Google's AI is busy right now. Please try again in a minute.");
+    }
+    return finish(strong);
   }
 
   // Local development only: add ?strong to the address to force the step-up and test the stronger model.
   const forceStrong = import.meta.env.DEV && typeof location !== "undefined" && new URLSearchParams(location.search).has("strong");
-  if (!best.check.ok || forceStrong) {
-    // The quick model's read does not add up: ask the stronger model before showing anything.
-    stepUp = best.check.ok
-      ? "A stronger model read it again (test mode)."
-      : `The first cloud read did not add up (${best.check.problems[0]}), so a stronger model read it again.`;
-    onStep("cloud");
-    try {
-      const strong = await withTimeout(cloudRead(strongModel, STRONG_MODEL), STRONG_TIMEOUT_MS);
-      if (!best.check.ok && !strong.check.ok && sameNumbers(best.invoice, strong.invoice)) {
-        // Two models read the same numbers, and they do not add up: the mistake is on the paper.
-        const paperError = `${best.check.problems.join(" ")} Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.`;
-        return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp, paperError };
-      }
-      if (!best.check.ok && strong.check.ok && best.invoice.total !== strong.invoice.total && sameNumbers({ ...best.invoice, total: null }, { ...strong.invoice, total: null })) {
-        // Same lines, different totals: one reader may have "fixed" the paper's sum. Show the paper's figure and say so.
-        const naira = (n: number | null) => (n === null ? "none" : `₦${n.toLocaleString("en-NG")}`);
-        const paperError = `The two reads agree on every line but not on the total (${naira(best.invoice.total)} and ${naira(strong.invoice.total)}). The lines add up to ${naira(strong.invoice.total)}. Look at the total on the paper: if it says ${naira(best.invoice.total)}, the invoice itself is wrong. Check it with the supplier before you pay.`;
-        return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp, paperError };
-      }
-      if (strong.check.ok || strong.check.problems.length < best.check.problems.length) {
-        best = strong;
-        model = STRONG_MODEL;
-      }
-    } catch {
-      stepUp += " The stronger model did not answer in time, so the first read is shown: please check it.";
-    }
+  const firstCheck = checkSums(first);
+  if (firstCheck.ok && !forceStrong) return finish(first);
+
+  // The quick model's read does not add up: ask the stronger model before showing anything.
+  stepUp = firstCheck.ok ? "A stronger model read it again (test mode)." : `The first cloud read did not add up (${firstCheck.problems[0]}), so a stronger model read it again.`;
+  onStep("cloud");
+  let second: Invoice;
+  try {
+    second = await cloudRead(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
+  } catch {
+    stepUp += " The stronger model did not answer in time, so the first read is shown: please check it against the paper.";
+    return finish(first);
   }
-  return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp };
+  const r = reconcile(first, second);
+  model = r.from === "second" ? STRONG_MODEL : CLOUD_MODEL;
+  return finish(r.invoice, { paperError: r.paperError, disputes: r.disputes.length ? r.disputes : undefined });
 }
 
-/** Retries a cloud call that failed because the service was busy (HTTP 429 or 5xx), twice, with a short wait. */
-async function withRetry<T>(call: () => Promise<T>): Promise<T> {
+/** Retries a cloud call that failed because the service was busy (HTTP 429 or 5xx), twice, unless it was cancelled. */
+async function withRetry<T>(call: () => Promise<T>, signal: AbortSignal): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await call();
     } catch (e) {
-      const busy = /\[(429|500|502|503|504)\b|high demand|overloaded|unavailable/i.test(String((e as Error).message ?? e));
-      if (!busy || attempt >= 2) throw e;
-      await new Promise((r) => setTimeout(r, attempt === 0 ? 1500 : 4000));
+      const busy = /\[(429|500|502|503|504)\b|high demand|overloaded|unavailable/i.test(message(e));
+      if (!busy || attempt >= 2 || signal.aborted) throw e;
+      await new Promise<void>((ok) => {
+        const id = setTimeout(ok, attempt === 0 ? 1500 : 4000);
+        signal.addEventListener("abort", () => (clearTimeout(id), ok()), { once: true });
+      });
+      if (signal.aborted) throw e;
     }
   }
 }

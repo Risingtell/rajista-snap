@@ -7,6 +7,7 @@ export type Product = {
   sellPrice: number | null; // the shop's own price, private
   lastCost: number | null; // the last cost price seen on an invoice
   aliases: string[]; // how suppliers have written this product, learned from the owner's choices ("supplier|text")
+  demo?: boolean; // saved from a sample invoice: kept apart from the shop's real products
 };
 
 /** Lower case, words only, common shop shorthand expanded, so "2 ctn Milo 400G" and "Milo 400g carton" compare well. */

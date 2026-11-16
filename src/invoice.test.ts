@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkSums, normalize, sameNumbers } from "./invoice";
+import { checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -88,5 +88,66 @@ describe("sameNumbers", () => {
 
   it("notices when a reader changed a number", () => {
     expect(sameNumbers(paper, { ...paper, total: 109500 })).toBe(false);
+  });
+});
+
+describe("reconcile", () => {
+  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
+  // Alhaji Musa invoice 1 as written: the lines make 109,500, the trader wrote 109,000.
+  const quick = { supplier: null, items: [line(2, "Ctn. Sgar 1kg", 30000, 60000), line(3, "Ctn. Indo Chkn 70g", 9500, 28500), line(1, "Ctn Peak Tin 160g", 21000, 21000)], total: 109000 };
+
+  it("confirms a paper error only when both reads found the same numbers, keeping the stronger read's names", () => {
+    const strong = { ...quick, supplier: "Alhaji Musa Wholesale", items: quick.items.map((l, i) => (i === 0 ? { ...l, description: "Ctn. Sugar 1kg" } : l)) };
+    const r = reconcile(quick, strong);
+    expect(r.paperError).toBe(
+      "The lines add up to ₦109,500, but the invoice total says ₦109,000. Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.",
+    );
+    expect(r.invoice.items[0].description).toBe("Ctn. Sugar 1kg");
+    expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
+    expect(r.disputes).toEqual([]);
+  });
+
+  it("does not blame the paper when the quick read simply misread the total", () => {
+    const misread = { ...quick, total: 108500 };
+    const right = { ...quick, total: 109500 };
+    const r = reconcile(misread, right);
+    expect(r.paperError).toBeUndefined();
+    expect(r.from).toBe("second");
+    expect(r.invoice.total).toBe(109500);
+    expect(r.disputes).toEqual([{ line: null, field: "total", shown: 109500, other: 108500 }]);
+  });
+
+  it("flags every number a stronger read changed, so a 'corrected' line cannot slip through unseen", () => {
+    const paper = { supplier: null, items: [line(3, "Milo", 1500, 4000), line(1, "Salt", 8000, 8000)], total: 12000 };
+    const fixed = { supplier: null, items: [line(3, "Milo", 1500, 4500), line(1, "Salt", 8000, 8000)], total: 12500 };
+    const r = reconcile(paper, fixed);
+    expect(r.paperError).toBeUndefined();
+    expect(r.disputes).toEqual([
+      { line: 0, field: "line_total", shown: 4500, other: 4000 },
+      { line: null, field: "total", shown: 12500, other: 12000 },
+    ]);
+  });
+
+  it("handles a second read with no total without inventing a sum", () => {
+    const r = reconcile(quick, { ...quick, total: null });
+    expect(r.paperError).toBeUndefined();
+    expect(r.disputes).toEqual([{ line: null, field: "total", shown: null, other: 109000 }]);
+  });
+
+  it("reports a different number of lines as a dispute on the line count", () => {
+    expect(disputes(quick, { ...quick, items: quick.items.slice(0, 2) })).toEqual([{ line: null, field: "lines", shown: 3, other: 2 }]);
+  });
+
+  it("sameLines ignores the total; sameNumbers does not", () => {
+    expect(sameLines(quick, { ...quick, total: 1 })).toBe(true);
+    expect(sameNumbers(quick, { ...quick, total: 1 })).toBe(false);
+  });
+});
+
+describe("naira", () => {
+  it("formats amounts and shows a chosen word for a missing one", () => {
+    expect(naira(109500)).toBe("₦109,500");
+    expect(naira(null)).toBe("");
+    expect(naira(null, "none")).toBe("none");
   });
 });
