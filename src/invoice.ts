@@ -50,8 +50,9 @@ export const READ_PROMPT =
   "List every product line: quantity, the product description copied exactly as written (join a description that runs over " +
   "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
-  "List any other amounts that make up the total but are not products, such as VAT, delivery, transport or a discount " +
-  "(a discount as a negative number), in charges; leave charges empty if there are none. " +
+  "List in charges any other amount that is written on the paper with its own figure and makes up the total, such as VAT, " +
+  "delivery, transport or a discount (a discount as a negative number). Never invent a charge to make the numbers add " +
+  "up; leave charges empty if none is written. " +
   "Also give the document total in naira (null if none), and the supplier: the business name printed at the top " +
   "of the paper (null if none). Numbers only, no commas or currency signs. Copy every number exactly as written, even " +
   "if the arithmetic on the paper is wrong: never correct or recalculate it.";
@@ -101,7 +102,11 @@ export type Check = {
   ok: boolean;
   /** One plain sentence per problem, shown to the shop owner when a read goes to the cloud. */
   problems: string[];
+  /** Small differences that could be a rounded unit price or a real overcharge: shown, but not a failure. */
+  notes: string[];
   hasPrices: boolean;
+  /** The read lists charges (VAT, delivery, discounts). They are confirmed by a second read before being trusted. */
+  hasCharges: boolean;
   /**
    * True only when another number on the page confirms the prices: every line has a total and the lines
    * add up to the invoice total. A lone price cannot confirm itself. A paper with no prices is trivially true.
@@ -116,10 +121,11 @@ export const naira = (n: number | null, none = "") => (n === null ? none : `₦$
 export const chargesTotal = (inv: Invoice) => (inv.charges ?? []).reduce((s, c) => s + c.amount, 0);
 
 // Totals on these papers are whole naira: the lines (and charges) must match the invoice total to within ₦1, so a
-// real ₦2,000 adding error on a ₦2.4 million invoice is caught. Unit prices are often rounded to the naira (a
-// carton split per piece: 12 × ₦1,083 for ₦13,000), so a line may be off by up to half a naira per unit.
+// real ₦2,000 adding error on a ₦2.4 million invoice is caught. A line's quantity × unit price must also match its
+// total to within ₦1. When it does not, but the unit price is the line total divided by the quantity rounded to the
+// naira (a carton split per piece: 12 × ₦1,083 for ₦13,000), the numbers cannot tell a rounded price from a small
+// overcharge, so the difference is shown to the owner as a note instead of failing the check.
 const closeTotal = (a: number, b: number) => Math.abs(a - b) <= 1;
-const closeLine = (quantity: number, unit: number, total: number) => Math.abs(quantity * unit - total) <= Math.max(1, Math.abs(quantity) * 0.5);
 
 /**
  * Does the invoice add up? Quantity x unit price must equal each line total, and the lines plus any charges must
@@ -127,14 +133,25 @@ const closeLine = (quantity: number, unit: number, total: number) => Math.abs(qu
  */
 export function checkSums(inv: Invoice): Check {
   const problems: string[] = [];
+  const notes: string[] = [];
   if (inv.items.length === 0) problems.push("No product lines were found.");
   let sum = 0;
   let allTotals = true;
   inv.items.forEach((l, i) => {
     if (l.quantity <= 0) problems.push(`Line ${i + 1}: the quantity ${l.quantity} cannot be right.`);
     const lineTotal = l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : null);
-    if (l.unit_price !== null && l.line_total !== null && !closeLine(l.quantity, l.unit_price, l.line_total)) {
-      problems.push(`Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(l.quantity * l.unit_price)}, not ${naira(l.line_total)}.`);
+    if (l.unit_price !== null && l.line_total !== null && l.quantity > 0) {
+      const product = l.quantity * l.unit_price;
+      const gap = l.line_total - product;
+      if (Math.abs(gap) > 1) {
+        if (Math.abs(l.unit_price - l.line_total / l.quantity) <= 0.5) {
+          notes.push(
+            `Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, and the line says ${naira(l.line_total)} (${naira(Math.abs(gap))} ${gap > 0 ? "more" : "less"}). The unit price may be rounded; check it if it matters.`,
+          );
+        } else {
+          problems.push(`Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, not ${naira(l.line_total)}.`);
+        }
+      }
     }
     if (lineTotal === null) allTotals = false;
     else sum += lineTotal;
@@ -153,15 +170,16 @@ export function checkSums(inv: Invoice): Check {
   }
   const ok = problems.length === 0;
   const crossChecked = !hasPrices || (ok && inv.total !== null && allTotals && inv.items.length > 0);
-  return { ok, problems, hasPrices, crossChecked };
+  return { ok, problems, notes, hasPrices, hasCharges: (inv.charges ?? []).length > 0, crossChecked };
 }
 
 /**
- * Whether an on-device read can be kept without asking the cloud: it adds up, it has prices, and another number on
- * the page confirms them. A read with no prices at all is not trusted, because the device may simply have failed
- * to read them; the cloud then checks the paper (a delivery note with no prices costs one quick cloud read).
+ * Whether an on-device read can be kept without asking the cloud: it adds up, it has prices, another number on the
+ * page confirms them, and it lists no charges. A read with no prices is not trusted (the device may simply have
+ * failed to read them), and neither is one that adds up only with charges: a reader could invent a "discount" to
+ * close a gap, so charges are always confirmed by a second, cloud read.
  */
-export const trustDeviceRead = (c: Check) => c.ok && c.hasPrices && c.crossChecked;
+export const trustDeviceRead = (c: Check) => c.ok && c.hasPrices && c.crossChecked && !c.hasCharges;
 
 /** True when two reads found the same lines: the same number of lines, with the same quantities and prices. */
 export function sameLines(a: Invoice, b: Invoice): boolean {
@@ -212,16 +230,17 @@ export type Reconciled = {
 };
 
 const PAPER_ADVICE =
-  " Check it with the supplier before you pay. (If the total includes VAT, delivery or a discount that is not listed above, it may not be a mistake.)";
+  " Check these numbers against the paper: if they match, the invoice itself does not add up, so check it with the supplier before you pay. (If the total includes VAT, delivery or a discount that is not listed above, it may not be a mistake.)";
 
 /**
- * Combines a first read that did not add up with a second read of the same photo.
+ * Combines a first read that did not add up (or listed charges) with a second read of the same photo.
  *
  * - Same numbers in both: both readers saw the same thing, so if it does not add up, the paper itself is wrong.
  *   The second (stronger) read's names and supplier are kept, with the shared numbers.
  * - Different numbers: neither read is confirmed. Show the read that adds up (or has clearly fewer problems), and
  *   list every number they disagree on. Never claim the paper is wrong here: one reader may simply have misread it,
- *   or may have "corrected" the paper's arithmetic. An empty read never replaces one that found lines.
+ *   or may have "corrected" the paper's arithmetic. On a tie the second (later, or stronger) read is shown, but an
+ *   empty read never replaces one that found lines.
  */
 export function reconcile(first: Invoice, second: Invoice): Reconciled {
   const a = checkSums(first);
@@ -230,11 +249,11 @@ export function reconcile(first: Invoice, second: Invoice): Reconciled {
     return {
       invoice: { ...second, supplier: second.supplier ?? first.supplier },
       disputes: [],
-      paperError: a.ok ? undefined : `${a.problems.join(" ")} Two separate reads found the same numbers, so the mistake looks to be on the invoice itself.${PAPER_ADVICE}`,
+      paperError: a.ok ? undefined : `${a.problems.join(" ")} Snap read the photo twice and got the same numbers both times.${PAPER_ADVICE}`,
     };
   }
   const secondEmpty = second.items.length === 0 && first.items.length > 0;
-  const useSecond = !secondEmpty && (b.ok || (!a.ok && b.problems.length < a.problems.length));
+  const useSecond = !secondEmpty && (b.ok || (!a.ok && b.problems.length <= a.problems.length));
   const shown = useSecond ? second : first;
   const other = useSecond ? first : second;
   return { invoice: { ...shown, supplier: shown.supplier ?? other.supplier }, disputes: disputes(shown, other) };
@@ -269,7 +288,7 @@ export function settleTotal(first: Invoice, second: Invoice, written: number | n
     return {
       invoice,
       disputes: [],
-      paperError: `${checkSums(invoice).problems.join(" ")} The total was read again on its own and the paper does say ${naira(failing.total)}, so the mistake looks to be on the invoice itself.${PAPER_ADVICE}`,
+      paperError: `${checkSums(invoice).problems.join(" ")} The total was read again on its own and came back as ${naira(failing.total)} again.${PAPER_ADVICE}`,
     };
   }
   if (written !== null && written === passing.total) return { invoice: { ...names, total: passing.total }, disputes: [] };

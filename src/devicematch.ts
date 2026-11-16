@@ -3,7 +3,10 @@
 // fallback here. Without an on-device model, the owner simply picks from the list.
 import { InferenceMode } from "firebase/ai";
 import type { Product } from "./match";
-import { assertOnDevice, deviceReadWaiting, onDevice, onDeviceModel } from "./reader";
+import { assertOnDevice, deviceReadWaiting, markDeviceSlow, onDevice, onDeviceModel } from "./reader";
+
+/** A product pick that takes longer than this cannot be cancelled, so the device is not used again this visit. */
+const PICK_TIMEOUT_MS = 20_000;
 
 const PICK_SCHEMA = { type: "object", properties: { choice: { type: "integer" } }, required: ["choice"] } as const;
 
@@ -28,14 +31,23 @@ export async function pickOnDevice(supplier: string | null, line: string, candid
   if (!candidates.length) return null;
   if (deviceReadWaiting()) throw new Error("A reading is waiting for the on-device model.");
   return onDevice(async () => {
-    const model = await onDeviceModel({
+    const model = await onDeviceModel("pick", {
       mode: InferenceMode.ONLY_ON_DEVICE,
       onDeviceParams: {
         createOptions: { expectedOutputs: [{ type: "text", languages: ["en"] }] },
         promptOptions: { responseConstraint: PICK_SCHEMA },
       },
     });
-    const r = await model.generateContent(pickPrompt(supplier, line, candidates));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const r = await Promise.race([
+      model.generateContent(pickPrompt(supplier, line, candidates)),
+      new Promise<never>((_, no) => {
+        timer = setTimeout(() => {
+          markDeviceSlow();
+          no(new Error("product pick took too long"));
+        }, PICK_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
     assertOnDevice(r);
     const n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
     return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;

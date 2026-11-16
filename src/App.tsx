@@ -422,9 +422,12 @@ export function App() {
                   : !check.hasPrices
                     ? "No prices on this paper."
                     : reading.disputes
-                      ? "Adds up as shown, but check the numbers marked in orange against the paper."
+                      ? reading.disputes.some((d) => d.field !== "lines" && d.field !== "charges")
+                        ? "Adds up as shown, but check the numbers marked in orange against the paper."
+                        : "Adds up as shown, but the two reads disagreed: check every line against the paper."
                       : "✓ Everything adds up."}
               </p>
+              {check.notes.length > 0 && <p className="private">{check.notes.join(" ")}</p>}
               <div className="actions">
                 <button className="primary" disabled={saving} onClick={saveAll}>
                   {saving ? "Saving…" : "Save to my products"}

@@ -49,6 +49,11 @@ describe("matchLine", () => {
     expect(matchLine("Alhaji Musa", "Ctn Indo Chkn 70g", saved).best?.product.id).toBe("indo");
   });
 
+  it("recognises the same supplier however the reader spaced or capitalised the name", () => {
+    expect(aliasKey("Rising Technology", "Ctn Peak Tin 160g")).toBe(aliasKey("RisingTechnology", "ctn. Peak Tin 160g"));
+    expect(aliasKey("RISING TECHNOLOGY.", "Peak")).toBe(aliasKey("rising technology", "Peak"));
+  });
+
   it("treats sizes as exact, so 400g never matches 900g", () => {
     expect(similarity("Milo 900g refill", "Milo 400g refill")).toBeLessThan(0.75);
   });

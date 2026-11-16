@@ -98,36 +98,29 @@ export async function downloadDeviceModel(onProgress: (fraction: number) => void
  * at creation time whether a device adapter exists, and without one it answers an ONLY_ON_DEVICE call from the
  * cloud. Creating the model here, after the check, means a private request can never be sent to the cloud.
  */
-export async function onDeviceModel(params: Parameters<typeof getGenerativeModel>[1] & { mode: typeof InferenceMode.ONLY_ON_DEVICE }) {
+const deviceModels = new Map<string, ReturnType<typeof getGenerativeModel>>();
+export async function onDeviceModel(key: string, params: Parameters<typeof getGenerativeModel>[1] & { mode: typeof InferenceMode.ONLY_ON_DEVICE }) {
   if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
-  return getGenerativeModel(ai, params);
+  // One model per kind of prompt, reused: each holds one Chrome session and replaces it on the next call, so
+  // sessions do not pile up on a small machine.
+  let m = deviceModels.get(key);
+  if (!m) deviceModels.set(key, (m = getGenerativeModel(ai, params)));
+  return m;
 }
+
+/** Stops using the on-device model for the rest of the visit (it ran past a time limit and cannot be cancelled). */
+export const markDeviceSlow = () => {
+  slow = true;
+};
 
 /** Throws if a call that was meant to stay on the device was answered in the cloud. */
 export function assertOnDevice(r: GenerateContentResult) {
   if (r.response.inferenceSource !== InferenceSource.ON_DEVICE) throw new Error("The answer did not come from the on-device model.");
 }
 
-// The on-device model runs one prompt at a time here: a reading waits for any product-matching prompt still
-// running (those cannot be cancelled), and while a reading is waiting, no new matching prompts start.
-let deviceQueue: Promise<unknown> = Promise.resolve();
-let readingWaiting = 0;
-export const deviceReadWaiting = () => readingWaiting > 0;
-export function onDevice<T>(job: () => Promise<T>, isReading = false): Promise<T> {
-  if (isReading) readingWaiting++;
-  const run = deviceQueue.then(
-    () => {
-      if (isReading) readingWaiting--;
-      return job();
-    },
-    () => {
-      if (isReading) readingWaiting--;
-      return job();
-    },
-  );
-  deviceQueue = run.catch(() => undefined);
-  return run;
-}
+// One on-device prompt at a time, readings first (src/devicequeue.ts).
+export { deviceReadWaiting, onDevice } from "./devicequeue";
+import { onDevice } from "./devicequeue";
 
 // ---- reading ---------------------------------------------------------------------------------------------
 export type Attempt = { ms: number; invoice?: Invoice; check?: Check; error?: string };
@@ -224,10 +217,11 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     whyCloud = "The on-device model was too slow on this computer earlier, so Snap reads in the cloud for the rest of this visit.";
   } else if (status === "available") {
     onStep("device");
-    const t = performance.now();
+    let t = performance.now();
     try {
       const r = await onDevice(async () => {
-        const model = await onDeviceModel({
+        t = performance.now(); // the time the device spent reading, not waiting for it
+        const model = await onDeviceModel("read", {
           mode: InferenceMode.ONLY_ON_DEVICE,
           onDeviceParams: {
             createOptions: { expectedInputs: [{ type: "image" }], expectedOutputs: [{ type: "text", languages: ["en"] }] },
@@ -245,11 +239,17 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
         ? `The on-device read did not add up: ${check.problems[0]}`
         : !check.hasPrices
           ? "The on-device read found no prices, so the cloud checked the paper."
-          : "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it.";
+          : check.hasCharges
+            ? "The on-device read listed charges (VAT, delivery or a discount), so the cloud checked them."
+            : "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it.";
     } catch (e) {
       if (/no answer after/.test(message(e))) slow = true;
       device = { ms: Math.round(performance.now() - t), error: message(e) };
-      whyCloud = slow ? "The on-device model took too long, so the cloud read it." : "The on-device model could not read this photo.";
+      whyCloud = slow
+        ? "The on-device model took too long, so the cloud read it."
+        : /device busy/.test(message(e))
+          ? "The on-device model was still busy matching products, so the cloud read it."
+          : "The on-device model could not read this photo.";
     }
   } else {
     whyCloud = status === "unsupported" ? "This browser has no on-device model." : "The on-device model is not ready on this computer.";
@@ -306,10 +306,15 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
   // Local development only: add ?strong to the address to force the second read and test the steps after it.
   const forceStrong = import.meta.env.DEV && typeof location !== "undefined" && new URLSearchParams(location.search).has("strong");
   const firstCheck = checkSums(first);
-  if (firstCheck.ok && !forceStrong) return finish(first);
+  if (firstCheck.ok && !firstCheck.hasCharges && !forceStrong) return finish(first);
 
-  // The quick read does not add up: the quick model reads the photo a second time before anything is shown.
-  stepUp = firstCheck.ok ? "It was read a second time (test mode)." : `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.`;
+  // The quick read does not add up, or it adds up only with charges (which a reader could invent to close a gap):
+  // the quick model reads the photo a second time before anything is shown.
+  stepUp = !firstCheck.ok
+    ? `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.`
+    : firstCheck.hasCharges
+      ? "The read listed charges (VAT, delivery or a discount), so it was read a second time to confirm them."
+      : "It was read a second time (test mode).";
   onStep("cloud");
   let second: Invoice;
   try {

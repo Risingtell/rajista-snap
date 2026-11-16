@@ -21,11 +21,13 @@ const deliveryNote = { items: [{ quantity: 1, description: 'Optoma SFP2075C17-D0
 
 describe("checkSums", () => {
   it("passes a correct read", () => {
-    expect(checkSums(normalize(cloudRising))).toEqual({ ok: true, problems: [], hasPrices: true, crossChecked: true });
+    expect(checkSums(normalize(cloudRising))).toEqual({ ok: true, problems: [], notes: [], hasPrices: true, hasCharges: false, crossChecked: true });
   });
 
   it("allows half a naira per unit for a unit price rounded to the naira (a carton split per piece)", () => {
-    expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13000 }], total: 13000 })).ok).toBe(true);
+    const split = checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13000 }], total: 13000 }));
+    expect(split.ok).toBe(true);
+    expect(split.notes).toEqual(["Line 1: 12 × ₦1,083 is ₦12,996, and the line says ₦13,000 (₦4 more). The unit price may be rounded; check it if it matters."]);
     expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13100 }], total: 13100 })).ok).toBe(false);
   });
 
@@ -53,7 +55,7 @@ describe("checkSums", () => {
   });
 
   it("passes a delivery note with no prices, and says so", () => {
-    expect(checkSums(normalize(deliveryNote))).toEqual({ ok: true, problems: [], hasPrices: false, crossChecked: true });
+    expect(checkSums(normalize(deliveryNote))).toEqual({ ok: true, problems: [], notes: [], hasPrices: false, hasCharges: false, crossChecked: true });
   });
 
   it("catches quantity times price that does not match the line total", () => {
@@ -73,6 +75,18 @@ describe("checkSums", () => {
     expect(noPrices.ok && noPrices.crossChecked).toBe(true);
     expect(trustDeviceRead(noPrices)).toBe(false);
     expect(trustDeviceRead(checkSums(normalize(cloudRising)))).toBe(true);
+  });
+
+  it("does not trust an on-device read that adds up only with a charge (a reader could invent a discount)", () => {
+    const invented = { items: [{ quantity: 1, description: "Sugar", unit_price: 109500, line_total: 109500 }], charges: [{ label: "Discount", amount: -500 }], total: 109000 };
+    const c = checkSums(normalize(invented));
+    expect(c.ok).toBe(true);
+    expect(trustDeviceRead(c)).toBe(false);
+  });
+
+  it("shows a bulk overcharge that a rounded unit price could explain as a note, not a pass in silence", () => {
+    const c = checkSums(normalize({ items: [{ quantity: 100, description: "Sachets", unit_price: 250, line_total: 25040 }], total: 25040 }));
+    expect(c.notes).toEqual(["Line 1: 100 × ₦250 is ₦25,000, and the line says ₦25,040 (₦40 more). The unit price may be rounded; check it if it matters."]);
   });
 
   it("rejects an empty read", () => {
@@ -126,8 +140,8 @@ describe("reconcile", () => {
   it("confirms a paper error only when both reads found the same numbers, keeping the stronger read's names", () => {
     const strong = { ...quick, supplier: "Alhaji Musa Wholesale", items: quick.items.map((l, i) => (i === 0 ? { ...l, description: "Ctn. Sugar 1kg" } : l)) };
     const r = reconcile(quick, strong);
-    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. Two separate reads found the same numbers/);
-    expect(r.paperError).toContain("Check it with the supplier before you pay.");
+    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. Snap read the photo twice and got the same numbers both times\. Check these numbers against the paper/);
+    expect(r.paperError).toContain("check it with the supplier before you pay");
     expect(r.invoice.items[0].description).toBe("Ctn. Sugar 1kg");
     expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
     expect(r.disputes).toEqual([]);
@@ -186,9 +200,11 @@ describe("reconcile edge cases", () => {
     expect(r.invoice.items).toHaveLength(3);
   });
 
-  it("prefers the stronger read only when it has clearly fewer problems", () => {
+  it("keeps the read with fewer problems, and shows the second (stronger) read on a tie", () => {
     const worse = { supplier: null, items: [line(2, "Sugar", 30000, 61000), line(3, "Indo", 9500, 28500), line(1, "Peak", 21000, 21000)], total: 100000 };
     expect(reconcile(quick, worse).invoice.items[0].line_total).toBe(60000);
+    const tie = { ...quick, items: quick.items.map((l, i) => (i === 1 ? { ...l, description: "Indomie" } : l)), total: 108000 };
+    expect(reconcile(quick, tie).invoice.total).toBe(108000);
   });
 });
 
@@ -207,7 +223,7 @@ describe("settleTotal (a third, narrow read of the written total)", () => {
     const r = settleTotal(copied, fixed, 109000);
     expect(r.invoice.total).toBe(109000);
     expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
-    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. The total was read again on its own and the paper does say ₦109,000/);
+    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. The total was read again on its own and came back as ₦109,000 again\. Check these numbers against the paper/);
     expect(r.disputes).toEqual([]);
   });
 

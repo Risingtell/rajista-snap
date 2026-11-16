@@ -47,7 +47,11 @@ export function similarity(line: string, product: string): number {
   return score / P.length;
 }
 
-export const aliasKey = (supplier: string | null, text: string) => `${(supplier ?? "").trim().toLowerCase()}|${words(text).join(" ")}`;
+/**
+ * How a supplier wrote a product, as a key. The supplier's name ignores case, spaces and punctuation, because readers
+ * spell the same printed name slightly differently ("Rising Technology", "RisingTechnology", "RISING TECHNOLOGY.").
+ */
+export const aliasKey = (supplier: string | null, text: string) => `${(supplier ?? "").toLowerCase().replace(/[^a-z0-9]/g, "")}|${words(text).join(" ")}`;
 
 export type Match = { product: Product; score: number; how: "learned" | "name" } | null;
 export type Candidates = { best: Match; others: Product[] };
