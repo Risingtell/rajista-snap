@@ -3,10 +3,11 @@
 // fallback here. Without an on-device model, the owner simply picks from the list.
 import { InferenceMode } from "firebase/ai";
 import type { Product } from "./match";
-import { assertOnDevice, deviceReadWaiting, markDeviceSlow, onDevice, onDeviceModel } from "./reader";
+import { assertOnDevice, deviceReadWaiting, deviceSlow, markDeviceSlow, onDevice, onDeviceModel } from "./reader";
 
 /** A product pick that takes longer than this cannot be cancelled, so the device is not used again this visit. */
 const PICK_TIMEOUT_MS = 20_000;
+const TOO_SLOW = "The on-device model ran past a time limit earlier in this visit.";
 
 const PICK_SCHEMA = { type: "object", properties: { choice: { type: "integer" } }, required: ["choice"] } as const;
 
@@ -22,15 +23,17 @@ export function pickPrompt(supplier: string | null, line: string, candidates: Pr
 }
 
 /**
- * The product the on-device model picked, or null. Throws if there is no on-device model, or if an invoice reading
- * is waiting for the model (readings go first). The model is created only after Chrome's model is confirmed present
+ * The product the on-device model picked, or null. Throws if there is no on-device model, if an invoice reading
+ * is waiting for the model (readings go first), or if the model already ran past a time limit in this visit. The model is created only after Chrome's model is confirmed present
  * (see onDeviceModel), so the product list cannot be sent to the cloud; the answer is also checked to have come
  * from the device.
  */
 export async function pickOnDevice(supplier: string | null, line: string, candidates: Product[]): Promise<Product | null> {
   if (!candidates.length) return null;
   if (deviceReadWaiting()) throw new Error("A reading is waiting for the on-device model.");
+  if (deviceSlow()) throw new Error(TOO_SLOW);
   return onDevice(async () => {
+    if (deviceSlow()) throw new Error(TOO_SLOW); // a pick queued before another one ran past its limit
     const model = await onDeviceModel("pick", {
       mode: InferenceMode.ONLY_ON_DEVICE,
       onDeviceParams: {

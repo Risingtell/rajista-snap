@@ -220,6 +220,8 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     let t = performance.now();
     try {
       const r = await onDevice(async () => {
+        // A product pick may have run past its time limit while this reading waited: Chrome is still busy with it.
+        if (slow) throw new Error("The on-device model ran past a time limit earlier in this visit.");
         t = performance.now(); // the time the device spent reading, not waiting for it
         const model = await onDeviceModel("read", {
           mode: InferenceMode.ONLY_ON_DEVICE,

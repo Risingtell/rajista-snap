@@ -178,8 +178,8 @@ export function App() {
         try {
           id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
         } catch {
-          /* no on-device answer (or a reading took priority): the owner picks */
-          if (deviceReadWaiting() || busyRef.current) return;
+          /* no on-device answer (a reading took priority, or the model ran past its time limit): the owner picks */
+          if (deviceReadWaiting() || busyRef.current || deviceSlow()) return;
         }
         if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
       }
