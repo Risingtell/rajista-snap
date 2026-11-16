@@ -7,7 +7,7 @@
 // The shop owner sees which reader produced each invoice and why it moved to the cloud.
 import { getGenerativeModel, InferenceMode, type GenerateContentResult } from "firebase/ai";
 import { ai } from "./firebase";
-import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, type Check, type Invoice } from "./invoice";
+import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, sameNumbers, type Check, type Invoice } from "./invoice";
 import type { Photo } from "./image";
 
 export const CLOUD_MODEL = "gemini-3.5-flash-lite";
@@ -78,6 +78,8 @@ export type Reading = {
   calls: { model: string; prompt: number; output: number }[];
   model?: string; // the cloud model whose read is shown
   stepUp?: string; // why the stronger model was used, when it was
+  /** Set when two separate reads found the same numbers and they still do not add up: the paper itself is wrong. */
+  paperError?: string;
 };
 
 const withTimeout = <T,>(p: Promise<T>, ms: number) =>
@@ -153,6 +155,11 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     onStep("cloud");
     try {
       const strong = await withTimeout(cloudRead(strongModel, STRONG_MODEL), STRONG_TIMEOUT_MS);
+      if (!best.check.ok && !strong.check.ok && sameNumbers(best.invoice, strong.invoice)) {
+        // Two models read the same numbers, and they do not add up: the mistake is on the paper.
+        const paperError = `${best.check.problems.join(" ")} Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.`;
+        return { ...best, source: "cloud", ms: Math.round(performance.now() - t), device, whyCloud, calls, model, stepUp, paperError };
+      }
       if (strong.check.ok || strong.check.problems.length < best.check.problems.length) {
         best = strong;
         model = STRONG_MODEL;

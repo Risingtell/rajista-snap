@@ -141,3 +141,4 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--brand-2); o
   .result .lines tfoot .money { text-align: right; max-width: 160px; }
   .match { margin-left: 8px; flex-wrap: wrap; }
 }
+.paper-error { border-radius: 12px; padding: 12px 14px; font-size: 14px; background: var(--amber-bg); color: #7c2d12; border: 1px solid #ecdcc0; }

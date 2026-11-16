@@ -40,7 +40,8 @@ export const READ_PROMPT =
   "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
   "Also give the document total in naira (null if none), and the supplier: the business name printed at the top " +
-  "of the paper (null if none). Numbers only, no commas or currency signs.";
+  "of the paper (null if none). Numbers only, no commas or currency signs. Copy every number exactly as written, even " +
+  "if the arithmetic on the paper is wrong: never correct or recalculate it.";
 
 const num = (v: unknown): number | null => {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -113,4 +114,13 @@ export function checkSums(inv: Invoice): Check {
   const ok = problems.length === 0;
   const crossChecked = !hasPrices || (ok && inv.total !== null && allTotals && inv.items.length > 0);
   return { ok, problems, hasPrices, crossChecked };
+}
+
+/** True when two reads found the same quantities and prices: then a failed sum check is the paper's own error. */
+export function sameNumbers(a: Invoice, b: Invoice): boolean {
+  if (a.items.length !== b.items.length || a.total !== b.total) return false;
+  return a.items.every((l, i) => {
+    const m = b.items[i];
+    return l.quantity === m.quantity && l.unit_price === m.unit_price && l.line_total === m.line_total;
+  });
 }

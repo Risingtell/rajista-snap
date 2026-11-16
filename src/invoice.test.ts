@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkSums, normalize } from "./invoice";
+import { checkSums, normalize, sameNumbers } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -69,5 +69,24 @@ describe("normalize", () => {
 
   it("throws when there is no item list", () => {
     expect(() => normalize({ total: 5 })).toThrow();
+  });
+});
+
+describe("sameNumbers", () => {
+  // Alhaji Musa invoice 1 (16 Nov sample): the lines add up to 109,500, but the trader wrote 109,000.
+  const paper = { supplier: null, items: [
+    { quantity: 2, description: "Ctn. Sugar 1kg", unit_price: 30000, line_total: 60000 },
+    { quantity: 3, description: "Ctn. Indo Chkn 70g", unit_price: 9500, line_total: 28500 },
+    { quantity: 1, description: "Ctn Peak Tin 160g", unit_price: 21000, line_total: 21000 },
+  ], total: 109000 };
+
+  it("sees that two readers agree, so the paper itself does not add up", () => {
+    const other = { ...paper, items: paper.items.map((l) => ({ ...l, description: l.description.toUpperCase() })) };
+    expect(sameNumbers(paper, other)).toBe(true);
+    expect(checkSums(paper).problems).toEqual(["The lines add up to ₦109,500, but the invoice total says ₦109,000."]);
+  });
+
+  it("notices when a reader changed a number", () => {
+    expect(sameNumbers(paper, { ...paper, total: 109500 })).toBe(false);
   });
 });

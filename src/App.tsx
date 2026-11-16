@@ -221,6 +221,11 @@ export function App() {
           {reading && invoice && check && (
             <div className="card result">
               <SourceBanner reading={reading} />
+              {reading.paperError && (
+                <div className="paper-error" role="alert">
+                  <b>This invoice does not add up.</b> {reading.paperError}
+                </div>
+              )}
               {reading.source === "device" && (
                 <button className="link" disabled={step !== null} onClick={cloudInstead}>
                   Names look wrong? Read it again in the cloud

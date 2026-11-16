@@ -16,6 +16,7 @@ export function words(s: string): string[] {
     .toLowerCase()
     .replace(/(\d)\s*(g|kg|ml|l|cl|gb|tb|mah)\b/g, "$1$2")
     .split(/[^a-z0-9.]+/)
+    .map((w) => w.replace(/^\.+|\.+$/g, "")) // "Ctn." is "ctn"; a decimal like "1.5kg" keeps its point
     .filter((w) => w && w.length > 1 && !["the", "and", "with", "of", "for"].includes(w))
     .map((w) => expand[w] ?? w);
 }
