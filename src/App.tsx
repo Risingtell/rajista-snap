@@ -4,7 +4,7 @@ import { preparePhoto, type Photo } from "./image";
 import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
 import { pickOnDevice } from "./devicematch";
 import { aliasKey, matchLine, type Product } from "./match";
-import { CLOUD_MODEL, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
+import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
 
@@ -150,14 +150,26 @@ export function App() {
     () => (invoice ? invoice.items.map((l) => matchLine(invoice.supplier, l.description, pool)) : []),
     [invoice, pool],
   );
-  // Lines the name matching was unsure about go to the on-device model, one at a time, privately. This runs once
-  // per reading (not on every keystroke), on the text as read.
+  // Only rerun the on-device matching when the products themselves change, not on every reload of the same list.
+  const poolKey = useMemo(() => pool.map((p) => `${p.id}:${p.name}:${p.aliases.length}`).join("|"), [pool]);
+  const poolRef = useRef(pool);
+  poolRef.current = pool;
+  const picksRef = useRef(devicePicks);
+  picksRef.current = devicePicks;
+  // Lines the name matching was unsure about go to the on-device model, one at a time, privately. This runs once per
+  // reading (not on every keystroke), on the text as read, skips lines already decided, and stops as soon as a new
+  // reading starts (readings get the on-device model first).
   useEffect(() => {
-    if (status !== "available" || deviceSlow() || !reading || !pool.length) return;
+    if (status !== "available" || deviceSlow() || !reading) return;
     const inv = reading.invoice;
     let stop = false;
     (async () => {
       for (let i = 0; i < inv.items.length && !stop; i++) {
+        if (busyRef.current || deviceReadWaiting()) return;
+        const key = aliasKey(inv.supplier, inv.items[i].description);
+        if (picksRef.current[i]?.key === key) continue;
+        const pool = poolRef.current;
+        if (!pool.length) return;
         const m = matchLine(inv.supplier, inv.items[i].description, pool);
         if (m.best) continue;
         const candidates = m.others.length ? m.others : pool.length <= 15 ? pool : [];
@@ -166,16 +178,16 @@ export function App() {
         try {
           id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
         } catch {
-          /* no on-device answer: the owner picks */
+          /* no on-device answer (or a reading took priority): the owner picks */
+          if (deviceReadWaiting() || busyRef.current) return;
         }
-        const key = aliasKey(inv.supplier, inv.items[i].description);
         if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
       }
     })();
     return () => {
       stop = true;
     };
-  }, [reading, status, pool]);
+  }, [reading, status, poolKey]);
 
   /** The on-device pick for line i, only while the line still says what the device judged. */
   const devicePickFor = (i: number) => {
@@ -288,7 +300,10 @@ export function App() {
           {busy ? "Reading…" : photo ? "Snap another invoice" : "Snap an invoice"}
         </button>
         <div className="samples">
-          <span>No invoice to hand? Try three handwritten visits to one wholesaler, or a printed invoice (both suppliers are made up):</span>
+          <span>
+            No invoice to hand? Try three handwritten invoices written on Rising Technology's own receipt book (Alhaji Musa Wholesale is a made-up
+            name), or a printed invoice from a made-up distributor:
+          </span>
           {SAMPLES.map((x) => (
             <button key={x.file} className="chip" disabled={busy} onClick={() => trySample(x.file)}>
               {x.label}
@@ -374,6 +389,24 @@ export function App() {
                   ))}
                 </tbody>
                 <tfoot>
+                  {(invoice.charges ?? []).map((c, k) => (
+                    <tr key={`c${k}`} className="charge">
+                      <td colSpan={3}>{c.label}</td>
+                      <td className="num">
+                        <MoneyInput
+                          label={`${c.label}, amount`}
+                          value={c.amount}
+                          onChange={(v) =>
+                            setInvoice({
+                              ...invoice,
+                              charges: (invoice.charges ?? []).flatMap((x, j) => (j !== k ? [x] : v === null ? [] : [{ ...x, amount: v }])),
+                            })
+                          }
+                        />
+                      </td>
+                      <td />
+                    </tr>
+                  ))}
                   <tr>
                     <td colSpan={3}>Invoice total</td>
                     <td className="num">
@@ -383,8 +416,14 @@ export function App() {
                   </tr>
                 </tfoot>
               </table>
-              <p className={check.ok ? "sums ok" : "sums bad"}>
-                {check.ok ? (check.hasPrices ? "✓ Everything adds up." : "No prices on this paper.") : check.problems.join(" ")}
+              <p className={check.ok && !reading.disputes ? "sums ok" : "sums bad"}>
+                {!check.ok
+                  ? check.problems.join(" ")
+                  : !check.hasPrices
+                    ? "No prices on this paper."
+                    : reading.disputes
+                      ? "Adds up as shown, but check the numbers marked in orange against the paper."
+                      : "✓ Everything adds up."}
               </p>
               <div className="actions">
                 <button className="primary" disabled={saving} onClick={saveAll}>
@@ -535,12 +574,14 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
 
 /** Explains disputed numbers without promising marks that are not on screen. */
 function DisputesNote({ disputes }: { disputes: Dispute[] }) {
-  const marked = disputes.filter((d) => d.field !== "lines").length;
+  const marked = disputes.filter((d) => d.field !== "lines" && d.field !== "charges").length;
   const lines = disputes.find((d) => d.field === "lines");
+  const charges = disputes.find((d) => d.field === "charges");
   return (
     <div className="disputes" role="status">
       <b>Check this invoice against the paper.</b> Two cloud reads disagreed.
       {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
+      {charges && ` Their charges (VAT, delivery, discounts) came to ${naira(charges.shown, "₦0")} and ${naira(charges.other, "₦0")}.`}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>
   );
@@ -558,7 +599,7 @@ function QuantityInput({ line, value, onChange, dispute }: { line: number; value
         value={text}
         onChange={(e) => setText(e.target.value)}
         onBlur={() => {
-          const n = Number(text.replace(/,/g, ".").trim());
+          const n = Number(text.replace(/,/g, "").trim()); // 1,000 is one thousand; decimals use a point
           if (text.trim() && Number.isFinite(n) && n !== value) onChange(n);
           else setText(String(value));
         }}

@@ -10,7 +10,7 @@ Built for Nigerian shops, where most supplier invoices are handwritten in carbon
 
 No account, no login, nothing to install. Open **https://snap.rajista.com** in any browser, on a phone or a computer.
 
-1. Tap **Invoice 1 · 3 Nov**. It is a handwritten invoice from a wholesaler (the supplier name is made up; the handwriting and receipt book are real). Snap reads it and warns that **the invoice itself does not add up**: the lines make ₦109,500, but the trader wrote ₦109,000.
+1. Tap **Invoice 1 · 3 Nov**. It is a real handwritten invoice, written on Rising Technology's own receipt book to a made-up customer, Alhaji Musa Wholesale. Snap reads it and warns that **the invoice itself does not add up**: the lines make ₦109,500, but the trader wrote ₦109,000.
 2. Tap **Save to my products**, then **Invoice 2 · 9 Nov**. The sugar and the noodles are written differently this time, and Snap still matches them to the products saved from invoice 1.
 3. Save again, then tap **Invoice 3 · 15 Nov**. Lines Snap has seen from this supplier say **Known from this supplier**.
 4. Type a selling price on a line, then try **Download for Rajista** (a file Rajista's Import screen reads) or **Share on WhatsApp**.
@@ -34,7 +34,7 @@ All AI calls go through **Firebase AI Logic**, protected by **App Check** (reCAP
 1. **Read on the device first.** If Chrome's built-in model (Gemini Nano) is available, Snap reads the photo on the device (`InferenceMode.ONLY_ON_DEVICE`, image input, JSON constrained to one schema).
 2. **Check the sums.** Every line must satisfy quantity × unit price = line total, and the lines must add up to the invoice total. A price is only trusted when another number on the page agrees with it (`src/invoice.ts`).
 3. **Send to the cloud only when needed.** If the device's read does not add up, found no prices at all, or the device cannot read, the same photo goes to `gemini-3.5-flash-lite` (`InferenceMode.ONLY_IN_CLOUD`). If that read does not add up either, or the quick model is busy, `gemini-3.6-flash` reads it again; busy errors are retried twice first, and every cloud call has a time limit after which it is cancelled (the on-device model cannot be cancelled through the SDK, so after a timeout Snap stops using it for the rest of the visit). The screen says which reader produced the result, how long it took, why it moved to the cloud, and what the cloud reads would cost at Google's paid rates.
-4. **Never "fix" the paper.** Both readers are told to copy numbers exactly, even when the paper's arithmetic is wrong. When two reads find the same numbers and they still do not add up, the mistake is on the invoice itself, and Snap says so: a supplier's adding error is money the shop would otherwise lose. When the two reads disagree, Snap shows the read that adds up and marks every disputed number, with the other read beside it, for the owner to check against the paper (`reconcile` in `src/invoice.ts`).
+4. **Never "fix" the paper.** Both readers are told to copy numbers exactly, even when the paper's arithmetic is wrong, and to list VAT, delivery and discounts separately so they count in the sum. When two reads find the same numbers and they still do not add up, the mistake is on the invoice itself, and Snap says so: a supplier's adding error is money the shop would otherwise lose. When the reads agree on every line but not on the total, one more narrow read of just the written total settles which one is right. Any other disagreement is shown with every disputed number marked, and the other read beside it, for the owner to check against the paper (`reconcile` and `settleTotal` in `src/invoice.ts`).
 5. **Keep the private work on the device.** The shop's product list, selling prices and each supplier's shorthand live in the browser (IndexedDB) and are never uploaded. When plain name matching is unsure, the on-device model picks the matching product. That step has no cloud fallback, on purpose: the code checks that Chrome's model is present before asking (without it, the SDK would answer an on-device request from the cloud) and that the answer really came from the device.
 
 What we measured on real invoices (14 to 16 November 2026, Chrome's on-device model on a 4-core CPU):
@@ -79,7 +79,7 @@ To see the on-device path, use desktop Chrome on a machine that meets [Chrome's 
 | `src/export.ts` | Rajista import file and WhatsApp message |
 | `src/settings.ts` | Remote Config values and the cost counter |
 | `public/sw.js` | Offline support |
-| `public/samples/` | The sample invoices: three handwritten by the shop owner on his own receipt book (the supplier name is made up) and one printed demo invoice |
+| `public/samples/` | The sample invoices: three handwritten on Rising Technology's own receipt book to a made-up customer, and one printed demo invoice from a made-up distributor |
 
 ## Built during #BuildHybridAI
 

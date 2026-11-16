@@ -1,6 +1,6 @@
 // Getting a checked invoice out of Snap: a file Rajista's Import screen reads, or a WhatsApp message.
 // Pure functions, so the formats are tested.
-import type { Invoice } from "./invoice";
+import { naira, type Invoice } from "./invoice";
 import type { Product } from "./match";
 
 /** One invoice line, resolved against the shop's own products. */
@@ -33,7 +33,6 @@ export function rajistaCsv(rs: Row[]): { csv: string; skipped: number } {
   return { csv: lines.map((l) => l.map(cell).join(",")).join("\r\n") + "\r\n", skipped: rs.length - ready.length };
 }
 
-const naira = (n: number) => `₦${n.toLocaleString("en-NG")}`;
 
 /** A plain message a shop owner can send to staff or a partner. Cost prices are only included if asked. */
 export function whatsappText(supplier: string | null, rs: Row[], withCost: boolean): string {

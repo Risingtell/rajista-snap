@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers, trustDeviceRead } from "./invoice";
+import { checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers, settleTotal, totalOnlyDispute, trustDeviceRead } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -22,6 +22,19 @@ const deliveryNote = { items: [{ quantity: 1, description: 'Optoma SFP2075C17-D0
 describe("checkSums", () => {
   it("passes a correct read", () => {
     expect(checkSums(normalize(cloudRising))).toEqual({ ok: true, problems: [], hasPrices: true, crossChecked: true });
+  });
+
+  it("allows half a naira per unit for a unit price rounded to the naira (a carton split per piece)", () => {
+    expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13000 }], total: 13000 })).ok).toBe(true);
+    expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13100 }], total: 13100 })).ok).toBe(false);
+  });
+
+  it("counts VAT, delivery and discounts in the sum, so a normal VAT invoice is not called wrong", () => {
+    const vat = { items: [{ quantity: 1, description: "Gas cooker", unit_price: 100000, line_total: 100000 }], charges: [{ label: "VAT 7.5%", amount: 7500 }], total: 107500 };
+    expect(checkSums(normalize(vat)).ok).toBe(true);
+    const discount = { ...vat, charges: [{ label: "Discount", amount: -5000 }], total: 95000 };
+    expect(checkSums(normalize(discount)).ok).toBe(true);
+    expect(checkSums(normalize({ ...vat, total: 108500 })).problems).toEqual(["The lines and charges add up to ₦107,500, but the invoice total says ₦108,500."]);
   });
 
   it("catches the on-device misread of the Rising Technology receipt", () => {
@@ -74,7 +87,7 @@ describe("checkSums", () => {
 describe("normalize", () => {
   it("cleans numbers written as text and joins broken descriptions", () => {
     const inv = normalize({ items: [{ quantity: "3", description: " HP Laptop\n 14 ", unit_price: "₦595,000", line_total: "1,785,000" }], total: "N1,785,000" });
-    expect(inv).toEqual({ supplier: null, items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], total: 1785000 });
+    expect(inv).toEqual({ supplier: null, items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], charges: [], total: 1785000 });
   });
 
   it("accepts a JSON string", () => {
@@ -113,9 +126,8 @@ describe("reconcile", () => {
   it("confirms a paper error only when both reads found the same numbers, keeping the stronger read's names", () => {
     const strong = { ...quick, supplier: "Alhaji Musa Wholesale", items: quick.items.map((l, i) => (i === 0 ? { ...l, description: "Ctn. Sugar 1kg" } : l)) };
     const r = reconcile(quick, strong);
-    expect(r.paperError).toBe(
-      "The lines add up to ₦109,500, but the invoice total says ₦109,000. Two separate reads found the same numbers, so the mistake is on the invoice itself. Check it with the supplier before you pay.",
-    );
+    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. Two separate reads found the same numbers/);
+    expect(r.paperError).toContain("Check it with the supplier before you pay.");
     expect(r.invoice.items[0].description).toBe("Ctn. Sugar 1kg");
     expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
     expect(r.disputes).toEqual([]);
@@ -126,7 +138,6 @@ describe("reconcile", () => {
     const right = { ...quick, total: 109500 };
     const r = reconcile(misread, right);
     expect(r.paperError).toBeUndefined();
-    expect(r.from).toBe("second");
     expect(r.invoice.total).toBe(109500);
     expect(r.disputes).toEqual([{ line: null, field: "total", shown: 109500, other: 108500 }]);
   });
@@ -163,5 +174,55 @@ describe("naira", () => {
     expect(naira(109500)).toBe("₦109,500");
     expect(naira(null)).toBe("");
     expect(naira(null, "none")).toBe("none");
+  });
+});
+
+describe("reconcile edge cases", () => {
+  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
+  const quick = { supplier: null, items: [line(2, "Sugar", 30000, 60000), line(3, "Indo", 9500, 28500), line(1, "Peak", 21000, 21000)], total: 109000 };
+
+  it("never lets an empty stronger read replace a read that found lines", () => {
+    const r = reconcile(quick, { supplier: null, items: [], total: null });
+    expect(r.invoice.items).toHaveLength(3);
+  });
+
+  it("prefers the stronger read only when it has clearly fewer problems", () => {
+    const worse = { supplier: null, items: [line(2, "Sugar", 30000, 61000), line(3, "Indo", 9500, 28500), line(1, "Peak", 21000, 21000)], total: 100000 };
+    expect(reconcile(quick, worse).invoice.items[0].line_total).toBe(60000);
+  });
+});
+
+describe("settleTotal (a third, narrow read of the written total)", () => {
+  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
+  const items = [line(2, "Ctn. Sugar 1kg", 30000, 60000), line(3, "Ctn. Indo Chkn 70g", 9500, 28500), line(1, "Ctn Peak Tin 160g", 21000, 21000)];
+  const copied = { supplier: null, items, total: 109000 }; // copied the paper faithfully: does not add up
+  const fixed = { supplier: "Alhaji Musa Wholesale", items, total: 109500 }; // "corrected" the sum: adds up
+
+  it("recognises a total-only dispute", () => {
+    expect(totalOnlyDispute(copied, fixed)).toBe(true);
+    expect(totalOnlyDispute(copied, { ...fixed, total: 109000 })).toBe(false);
+  });
+
+  it("confirms the paper's error when the written total matches the read that does not add up", () => {
+    const r = settleTotal(copied, fixed, 109000);
+    expect(r.invoice.total).toBe(109000);
+    expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
+    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. The total was read again on its own and the paper does say ₦109,000/);
+    expect(r.disputes).toEqual([]);
+  });
+
+  it("trusts the read that adds up when the written total matches it (the quick read misread)", () => {
+    const misread = { ...copied, total: 108500 };
+    const right = { ...fixed, total: 109500 };
+    const r = settleTotal(misread, right, 109500);
+    expect(r.invoice.total).toBe(109500);
+    expect(r.paperError).toBeUndefined();
+    expect(r.disputes).toEqual([]);
+  });
+
+  it("leaves the total for the owner to check when the third read agrees with neither", () => {
+    const r = settleTotal(copied, fixed, 190000);
+    expect(r.paperError).toBeUndefined();
+    expect(r.disputes).toEqual([{ line: null, field: "total", shown: 109500, other: 109000 }]);
   });
 });

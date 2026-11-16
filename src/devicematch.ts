@@ -1,20 +1,11 @@
 // When the plain name matching is not sure, Chrome's on-device model picks which of the shop's products an
 // invoice line means. This only ever runs on the device: the product list is private, so there is no cloud
 // fallback here. Without an on-device model, the owner simply picks from the list.
-import { getGenerativeModel, InferenceMode } from "firebase/ai";
-import { ai } from "./firebase";
+import { InferenceMode } from "firebase/ai";
 import type { Product } from "./match";
-import { assertOnDevice, deviceStatus } from "./reader";
+import { assertOnDevice, deviceReadWaiting, onDevice, onDeviceModel } from "./reader";
 
 const PICK_SCHEMA = { type: "object", properties: { choice: { type: "integer" } }, required: ["choice"] } as const;
-
-const model = getGenerativeModel(ai, {
-  mode: InferenceMode.ONLY_ON_DEVICE,
-  onDeviceParams: {
-    createOptions: { expectedOutputs: [{ type: "text", languages: ["en"] }] },
-    promptOptions: { responseConstraint: PICK_SCHEMA },
-  },
-});
 
 export function pickPrompt(supplier: string | null, line: string, candidates: Product[]): string {
   return [
@@ -28,15 +19,25 @@ export function pickPrompt(supplier: string | null, line: string, candidates: Pr
 }
 
 /**
- * The product the on-device model picked, or null. Throws if there is no on-device model: without Chrome's model
- * the Firebase SDK would send even an ONLY_ON_DEVICE call to the cloud, so the check here is what keeps the
- * product list private, and the answer is checked to have really come from the device.
+ * The product the on-device model picked, or null. Throws if there is no on-device model, or if an invoice reading
+ * is waiting for the model (readings go first). The model is created only after Chrome's model is confirmed present
+ * (see onDeviceModel), so the product list cannot be sent to the cloud; the answer is also checked to have come
+ * from the device.
  */
 export async function pickOnDevice(supplier: string | null, line: string, candidates: Product[]): Promise<Product | null> {
   if (!candidates.length) return null;
-  if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
-  const r = await model.generateContent(pickPrompt(supplier, line, candidates));
-  assertOnDevice(r);
-  const n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
-  return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;
+  if (deviceReadWaiting()) throw new Error("A reading is waiting for the on-device model.");
+  return onDevice(async () => {
+    const model = await onDeviceModel({
+      mode: InferenceMode.ONLY_ON_DEVICE,
+      onDeviceParams: {
+        createOptions: { expectedOutputs: [{ type: "text", languages: ["en"] }] },
+        promptOptions: { responseConstraint: PICK_SCHEMA },
+      },
+    });
+    const r = await model.generateContent(pickPrompt(supplier, line, candidates));
+    assertOnDevice(r);
+    const n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
+    return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;
+  });
 }
