@@ -9,7 +9,7 @@ describe("cloudCost", () => {
     expect(c.usd).toBeCloseTo(0.0008132, 7);
     expect(c.ngn).toBeCloseTo(1.22, 2);
     // A step-up adds the stronger model's call at its own price.
-    const both = cloudCost([{ model: "gemini-3.5-flash-lite", prompt: 1194, output: 182 }, { model: "gemini-3.8-flash", prompt: 1194, output: 300 }], rates);
+    const both = cloudCost([{ model: "gemini-3.5-flash-lite", prompt: 1194, output: 182 }, { model: "gemini-3.6-flash", prompt: 1194, output: 300 }], rates);
     expect(both.usd).toBeCloseTo(0.0008132 + 0.0008955 + 0.001125, 7);
   });
 });

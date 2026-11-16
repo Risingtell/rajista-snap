@@ -7,15 +7,18 @@
 //      paper itself is wrong; different numbers are shown to the owner to check.
 //
 // The shop owner sees which reader produced each invoice and why it moved to the cloud.
-import { getGenerativeModel, InferenceMode, type GenerateContentResult } from "firebase/ai";
+import { getGenerativeModel, InferenceMode, InferenceSource, type GenerateContentResult } from "firebase/ai";
 import { ai } from "./firebase";
-import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, reconcile, type Check, type Dispute, type Invoice } from "./invoice";
+import { checkSums, INVOICE_JSON_SCHEMA, normalize, READ_PROMPT, reconcile, trustDeviceRead, type Check, type Dispute, type Invoice } from "./invoice";
 import type { Photo } from "./image";
+import { CLOUD_MODEL, STRONG_MODEL } from "./models";
 
-export const CLOUD_MODEL = "gemini-3.5-flash-lite";
-/** A stronger cloud model, used only when the first cloud read does not add up (a sideways or faint photo). */
-export const STRONG_MODEL = "gemini-3.6-flash";
-/** Time limits, each covering a reader's retries too. A call still running at its limit is cancelled. */
+export { CLOUD_MODEL, STRONG_MODEL };
+/**
+ * Time limits, each covering a reader's retries too. A cloud call still running at its limit is cancelled. The
+ * on-device model cannot be cancelled through the Firebase SDK, so Snap stops waiting for it and stops using it
+ * for the rest of the visit (see deviceSlow), rather than piling more work onto a busy computer.
+ */
 const DEVICE_TIMEOUT_MS = 90_000;
 const QUICK_TIMEOUT_MS = 50_000;
 const STRONG_TIMEOUT_MS = 50_000;
@@ -44,6 +47,10 @@ type LM = {
 const lm = (): LM | undefined => (globalThis as unknown as { LanguageModel?: LM }).LanguageModel;
 export type DeviceStatus = "unsupported" | "unavailable" | "downloadable" | "downloading" | "available";
 const IMAGE_INPUT = { expectedInputs: [{ type: "image" }] };
+
+/** Set when the on-device model ran past its time limit: the rest of this visit reads in the cloud. */
+let slow = false;
+export const deviceSlow = () => slow;
 
 export async function deviceStatus(): Promise<DeviceStatus> {
   const api = lm();
@@ -109,6 +116,18 @@ function parse(r: GenerateContentResult): Invoice {
 
 const message = (e: unknown) => String((e as Error)?.message ?? e);
 const refusedByAppCheck = (e: unknown) => /app ?check|\[40[13]\b/i.test(message(e));
+const offline = (e: unknown) => (typeof navigator !== "undefined" && navigator.onLine === false) || /failed to fetch|network ?error|load failed/i.test(message(e));
+const busyError = (e: unknown) => /\[(429|500|502|503|504)\b|high demand|overloaded|unavailable/i.test(message(e));
+const OFFLINE_MESSAGE = "This phone or computer is offline, and this photo needs the cloud to be read. Connect to the internet and try again.";
+
+/** Throws unless Chrome's model is really present: without it, the SDK would quietly send a device-only call to the cloud. */
+async function requireDevice() {
+  if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
+}
+/** Throws if a call that was meant to stay on the device was answered in the cloud. */
+export function assertOnDevice(r: GenerateContentResult) {
+  if (r.response.inferenceSource !== InferenceSource.ON_DEVICE) throw new Error("The answer did not come from the on-device model.");
+}
 
 export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud") => void, opts: { forceCloud?: boolean } = {}): Promise<Reading> {
   let device: Attempt | undefined;
@@ -117,20 +136,28 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
 
   if (opts.forceCloud) {
     whyCloud = "You asked for a cloud read.";
+  } else if (status === "available" && slow) {
+    whyCloud = "The on-device model was too slow on this computer earlier, so Snap reads in the cloud for the rest of this visit.";
   } else if (status === "available") {
     onStep("device");
     const t = performance.now();
     try {
-      const invoice = parse(await timed((signal) => ask(deviceModel, photo, signal), DEVICE_TIMEOUT_MS));
+      await requireDevice();
+      const r = await timed((signal) => ask(deviceModel, photo, signal), DEVICE_TIMEOUT_MS);
+      assertOnDevice(r);
+      const invoice = parse(r);
       const check = checkSums(invoice);
       device = { ms: Math.round(performance.now() - t), invoice, check };
-      if (check.ok && check.crossChecked) return { invoice, check, source: "device", ms: device.ms, device, calls: [] };
-      whyCloud = check.ok
-        ? "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it."
-        : `The on-device read did not add up: ${check.problems[0]}`;
+      if (trustDeviceRead(check)) return { invoice, check, source: "device", ms: device.ms, device, calls: [] };
+      whyCloud = !check.ok
+        ? `The on-device read did not add up: ${check.problems[0]}`
+        : !check.hasPrices
+          ? "The on-device read found no prices, so the cloud checked the paper."
+          : "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it.";
     } catch (e) {
+      if (/no answer after/.test(message(e))) slow = true;
       device = { ms: Math.round(performance.now() - t), error: message(e) };
-      whyCloud = "The on-device model could not read this photo.";
+      whyCloud = slow ? "The on-device model took too long, so the cloud read it." : "The on-device model could not read this photo.";
     }
   } else {
     whyCloud = status === "unsupported" ? "This browser has no on-device model." : "The on-device model is not ready on this computer.";
@@ -161,20 +188,26 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     first = await cloudRead(cloudModel, CLOUD_MODEL, QUICK_TIMEOUT_MS);
   } catch (e) {
     if (refusedByAppCheck(e)) {
+      finished = true;
       throw new Error(
         "Google's security check did not accept this browser, so the AI would not read the photo. Reload the page and try again. If it keeps happening, try another browser or come back later.",
       );
     }
-    // The quick model is busy or down: the stronger model reads it instead.
-    stepUp = "The quick cloud model was busy, so a stronger model read it.";
+    if (offline(e)) {
+      finished = true;
+      throw new Error(OFFLINE_MESSAGE);
+    }
+    // The quick model is busy, down or answered something unreadable: the stronger model reads it instead.
+    stepUp = busyError(e) ? "The quick cloud model was busy, so a stronger model read it." : "The quick cloud model's answer could not be used, so a stronger model read it.";
     model = STRONG_MODEL;
     onStep("cloud");
     let strong: Invoice;
     try {
       strong = await cloudRead(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
-    } catch {
+    } catch (e2) {
       finished = true;
-      throw new Error("Google's AI is busy right now. Please try again in a minute.");
+      if (offline(e2)) throw new Error(OFFLINE_MESSAGE);
+      throw new Error(`Google's AI could not read this photo right now (${message(e2).slice(0, 80)}). Please try again in a minute.`);
     }
     return finish(strong);
   }
@@ -205,8 +238,7 @@ async function withRetry<T>(call: () => Promise<T>, signal: AbortSignal): Promis
     try {
       return await call();
     } catch (e) {
-      const busy = /\[(429|500|502|503|504)\b|high demand|overloaded|unavailable/i.test(message(e));
-      if (!busy || attempt >= 2 || signal.aborted) throw e;
+      if (!busyError(e) || attempt >= 2 || signal.aborted) throw e;
       await new Promise<void>((ok) => {
         const id = setTimeout(ok, attempt === 0 ? 1500 : 4000);
         signal.addEventListener("abort", () => (clearTimeout(id), ok()), { once: true });

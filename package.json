@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "deploy": "npm run build && npx wrangler@4 deploy"
+    "deploy": "npm run build && node scripts/check-dist.mjs && npx wrangler@4 deploy"
   },
   "dependencies": {
     "firebase": "^13.2.0",

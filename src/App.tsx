@@ -4,7 +4,7 @@ import { preparePhoto, type Photo } from "./image";
 import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
 import { pickOnDevice } from "./devicematch";
 import { aliasKey, matchLine, type Product } from "./match";
-import { CLOUD_MODEL, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
+import { CLOUD_MODEL, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
 
@@ -32,8 +32,11 @@ export function App() {
   const [choices, setChoices] = useState<Choice[]>([]);
   const [prices, setPrices] = useState<(number | null)[]>([]);
   const [saved, setSaved] = useState<string | null>(null);
-  // Lines the on-device model matched to a product (id), or "none" when it found no match.
-  const [devicePicks, setDevicePicks] = useState<(string | undefined)[]>([]);
+  // Lines the on-device model matched to a product (id), or "none" when it found no match, with the text it
+  // judged: once the owner edits a line's text or the supplier, that pick no longer applies to it.
+  const [devicePicks, setDevicePicks] = useState<({ key: string; id: string } | undefined)[]>([]);
+  const savingRef = useRef(false);
+  const [saving, setSaving] = useState(false);
   // One reading at a time: a second tap while one is running is ignored (busyRef is checked synchronously).
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
@@ -147,43 +150,62 @@ export function App() {
     () => (invoice ? invoice.items.map((l) => matchLine(invoice.supplier, l.description, pool)) : []),
     [invoice, pool],
   );
-  // Lines the name matching was unsure about go to the on-device model, one at a time, privately.
+  // Lines the name matching was unsure about go to the on-device model, one at a time, privately. This runs once
+  // per reading (not on every keystroke), on the text as read.
   useEffect(() => {
-    if (status !== "available" || !invoice || !pool.length) return;
+    if (status !== "available" || deviceSlow() || !reading || !pool.length) return;
+    const inv = reading.invoice;
     let stop = false;
     (async () => {
-      for (let i = 0; i < matches.length && !stop; i++) {
-        if (matches[i].best || devicePicks[i] !== undefined) continue;
-        const candidates = matches[i].others.length ? matches[i].others : pool.length <= 15 ? pool : [];
+      for (let i = 0; i < inv.items.length && !stop; i++) {
+        const m = matchLine(inv.supplier, inv.items[i].description, pool);
+        if (m.best) continue;
+        const candidates = m.others.length ? m.others : pool.length <= 15 ? pool : [];
         if (!candidates.length) continue;
-        let pick: string = "none";
+        let id = "none";
         try {
-          pick = (await pickOnDevice(invoice.supplier, invoice.items[i].description, candidates))?.id ?? "none";
+          id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
         } catch {
           /* no on-device answer: the owner picks */
         }
-        if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: pick }));
+        const key = aliasKey(inv.supplier, inv.items[i].description);
+        if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
       }
     })();
     return () => {
       stop = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [matches, status]);
+  }, [reading, status, pool]);
+
+  /** The on-device pick for line i, only while the line still says what the device judged. */
+  const devicePickFor = (i: number) => {
+    const d = devicePicks[i];
+    if (!d || d.id === "none" || !invoice || d.key !== aliasKey(invoice.supplier, invoice.items[i]?.description ?? "")) return undefined;
+    return pool.find((p) => p.id === d.id);
+  };
 
   const resolved: (Product | null)[] = matches.map((m, i) => {
     const c = choices[i];
     if (c === "new") return null;
     if (c) return products.find((p) => p.id === c) ?? null;
     if (m.best) return m.best.product;
-    const d = devicePicks[i];
-    return d && d !== "none" ? products.find((p) => p.id === d) ?? null : null;
+    return devicePickFor(i) ?? null;
   });
-  const withPrices = resolved.map((p, i) => (p ? { ...p, sellPrice: prices[i] ?? p.sellPrice } : null));
 
   /** Saves every line to the product list: new products, latest cost prices, selling prices, and what each supplier calls them. */
   async function saveAll() {
-    if (!invoice) return;
+    if (!invoice || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await saveLines(invoice);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function saveLines(invoice: Invoice) {
     const byId = new Map(products.map((p) => [p.id, { ...p, aliases: [...p.aliases] }]));
     let added = 0, learned = 0;
     invoice.items.forEach((l, i) => {
@@ -223,7 +245,7 @@ export function App() {
 
   function downloadCsv() {
     if (!invoice) return;
-    const { csv, skipped } = rajistaCsv(rows(invoice, withPrices));
+    const { csv, skipped } = rajistaCsv(rows(invoice, resolved, prices));
     if (skipped === invoice.items.length) {
       setError("Add your selling price to at least one line first: Rajista needs a price for every product.");
       return;
@@ -238,7 +260,7 @@ export function App() {
 
   function shareWhatsApp() {
     if (!invoice) return;
-    window.open(`https://wa.me/?text=${encodeURIComponent(whatsappText(invoice.supplier, rows(invoice, withPrices), false))}`, "_blank", "noopener");
+    window.open(`https://wa.me/?text=${encodeURIComponent(whatsappText(invoice.supplier, rows(invoice, resolved, prices), false))}`, "_blank", "noopener");
   }
 
   const check = invoice ? checkSums(invoice) : null;
@@ -261,7 +283,7 @@ export function App() {
       </header>
 
       <section className="card scan">
-        <input ref={fileRef} id="photo" type="file" accept="image/*" capture="environment" hidden onChange={(e) => onFile(e.target.files?.[0])} />
+        <input ref={fileRef} id="photo" type="file" accept="image/*" hidden onChange={(e) => onFile(e.target.files?.[0])} />
         <button className="primary big" disabled={busy} onClick={() => fileRef.current?.click()}>
           {busy ? "Reading…" : photo ? "Snap another invoice" : "Snap an invoice"}
         </button>
@@ -298,13 +320,7 @@ export function App() {
                     <b>This invoice does not add up.</b> {reading.paperError}
                   </div>
                 ))}
-              {reading.disputes && (
-                <div className="disputes" role="status">
-                  <b>Check {reading.disputes.length === 1 ? "one number" : `${reading.disputes.length} numbers`} against the paper.</b> Two cloud reads
-                  disagreed, so they are marked in orange with the other read beside them.
-                  {reading.disputes.some((d) => d.field === "lines") && " They also found a different number of lines."}
-                </div>
-              )}
+              {reading.disputes && <DisputesNote disputes={reading.disputes} />}
               {reading.source === "device" && (
                 <button className="link" disabled={busy} onClick={cloudInstead}>
                   Names look wrong? Read it again in the cloud
@@ -328,21 +344,14 @@ export function App() {
                   {invoice.items.map((l, i) => (
                     <tr key={i}>
                       <td data-label="Qty">
-                        <input
-                          aria-label={`Quantity, line ${i + 1}`}
-                          className={other(i, "quantity") ? "disputed" : undefined}
-                          inputMode="decimal"
-                          value={l.quantity}
-                          onChange={(e) => edit(i, { quantity: Number(e.target.value) || 0 })}
-                        />
-                        <OtherRead d={other(i, "quantity")} plain />
+                        <QuantityInput line={i} value={l.quantity} onChange={(q) => edit(i, { quantity: q })} dispute={other(i, "quantity")} />
                       </td>
                       <td data-label="Product" className="product">
                         <input aria-label={`Product, line ${i + 1}`} value={l.description} onChange={(e) => edit(i, { description: e.target.value })} />
                         <MatchPicker
                           line={i}
                           suggestion={matches[i]}
-                          devicePick={devicePicks[i] && devicePicks[i] !== "none" ? pool.find((p) => p.id === devicePicks[i]) : undefined}
+                          devicePick={devicePickFor(i)}
                           choice={choices[i]}
                           products={pool}
                           onPick={(c) => setChoices((cs) => Object.assign([...cs], { [i]: c }))}
@@ -378,8 +387,8 @@ export function App() {
                 {check.ok ? (check.hasPrices ? "✓ Everything adds up." : "No prices on this paper.") : check.problems.join(" ")}
               </p>
               <div className="actions">
-                <button className="primary" onClick={saveAll}>
-                  Save to my products
+                <button className="primary" disabled={saving} onClick={saveAll}>
+                  {saving ? "Saving…" : "Save to my products"}
                 </button>
                 <button className="ghost" onClick={downloadCsv}>
                   Download for Rajista
@@ -521,6 +530,41 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
         </tbody>
       </table>
     </details>
+  );
+}
+
+/** Explains disputed numbers without promising marks that are not on screen. */
+function DisputesNote({ disputes }: { disputes: Dispute[] }) {
+  const marked = disputes.filter((d) => d.field !== "lines").length;
+  const lines = disputes.find((d) => d.field === "lines");
+  return (
+    <div className="disputes" role="status">
+      <b>Check this invoice against the paper.</b> Two cloud reads disagreed.
+      {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
+      {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
+    </div>
+  );
+}
+
+function QuantityInput({ line, value, onChange, dispute }: { line: number; value: number; onChange: (q: number) => void; dispute?: Dispute }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  return (
+    <>
+      <input
+        aria-label={`Quantity, line ${line + 1}`}
+        className={dispute ? "disputed" : undefined}
+        inputMode="decimal"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={() => {
+          const n = Number(text.replace(/,/g, ".").trim());
+          if (text.trim() && Number.isFinite(n) && n !== value) onChange(n);
+          else setText(String(value));
+        }}
+      />
+      <OtherRead d={dispute} plain />
+    </>
   );
 }
 

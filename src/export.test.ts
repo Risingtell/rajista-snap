@@ -21,6 +21,16 @@ describe("rows", () => {
   });
 });
 
+describe("rows with typed prices", () => {
+  it("exports a price typed on a line that is not yet one of the shop's products", () => {
+    expect(rows(inv, [null, null], [650000, 165000]).map((r) => r.price)).toEqual([650000, 165000]);
+  });
+
+  it("lets a typed price replace the stored one", () => {
+    expect(rows(inv, [hp, null], [700000])[0].price).toBe(700000);
+  });
+});
+
 describe("rajistaCsv", () => {
   it("writes the headings Rajista recognises, quotes commas, and leaves out lines with no selling price", () => {
     const withPrice = rows(inv, [hp, { ...hp, id: "c", name: "Maxi cooker, 4 burners", sellPrice: 165000 }]);

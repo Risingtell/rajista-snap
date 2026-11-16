@@ -6,11 +6,15 @@ import type { Product } from "./match";
 /** One invoice line, resolved against the shop's own products. */
 export type Row = { name: string; quantity: number; cost: number | null; price: number | null };
 
-export function rows(inv: Invoice, chosen: (Product | null)[]): Row[] {
+/**
+ * One row per invoice line. `typed` holds the selling prices the owner typed on this screen; they win over the
+ * stored price, and they count for lines that are not (yet) one of the shop's products.
+ */
+export function rows(inv: Invoice, chosen: (Product | null)[], typed: (number | null | undefined)[] = []): Row[] {
   return inv.items.map((l, i) => {
     const p = chosen[i];
     const cost = l.unit_price ?? (l.line_total !== null && l.quantity > 0 ? Math.round(l.line_total / l.quantity) : null);
-    return { name: p?.name ?? l.description, quantity: l.quantity, cost, price: p?.sellPrice ?? null };
+    return { name: p?.name ?? l.description, quantity: l.quantity, cost, price: typed[i] ?? p?.sellPrice ?? null };
   });
 }
 

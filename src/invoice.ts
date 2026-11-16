@@ -83,7 +83,9 @@ export type Check = {
   crossChecked: boolean;
 };
 
-const close = (a: number, b: number) => Math.abs(a - b) <= Math.max(1, Math.abs(b) * 0.001);
+// Naira amounts are whole numbers on these papers; allow one naira for rounding (1.5 x 3,333) and no more,
+// so a real ₦2,000 adding error on a ₦2.4 million invoice is still caught.
+const close = (a: number, b: number) => Math.abs(a - b) <= 1;
 /** Naira as shop owners write it: ₦109,500. A missing amount shows as `none` (empty by default). */
 export const naira = (n: number | null, none = "") => (n === null ? none : `₦${n.toLocaleString("en-NG")}`);
 
@@ -116,6 +118,13 @@ export function checkSums(inv: Invoice): Check {
   const crossChecked = !hasPrices || (ok && inv.total !== null && allTotals && inv.items.length > 0);
   return { ok, problems, hasPrices, crossChecked };
 }
+
+/**
+ * Whether an on-device read can be kept without asking the cloud: it adds up, it has prices, and another number on
+ * the page confirms them. A read with no prices at all is not trusted, because the device may simply have failed
+ * to read them; the cloud then checks the paper (a delivery note with no prices costs one quick cloud read).
+ */
+export const trustDeviceRead = (c: Check) => c.ok && c.hasPrices && c.crossChecked;
 
 /** True when two reads found the same lines: the same number of lines, with the same quantities and prices. */
 export function sameLines(a: Invoice, b: Invoice): boolean {

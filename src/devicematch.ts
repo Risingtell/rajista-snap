@@ -4,6 +4,7 @@
 import { getGenerativeModel, InferenceMode } from "firebase/ai";
 import { ai } from "./firebase";
 import type { Product } from "./match";
+import { assertOnDevice, deviceStatus } from "./reader";
 
 const PICK_SCHEMA = { type: "object", properties: { choice: { type: "integer" } }, required: ["choice"] } as const;
 
@@ -26,10 +27,16 @@ export function pickPrompt(supplier: string | null, line: string, candidates: Pr
   ].join("\n");
 }
 
-/** The product the on-device model picked, or null. Throws if there is no on-device model. */
+/**
+ * The product the on-device model picked, or null. Throws if there is no on-device model: without Chrome's model
+ * the Firebase SDK would send even an ONLY_ON_DEVICE call to the cloud, so the check here is what keeps the
+ * product list private, and the answer is checked to have really come from the device.
+ */
 export async function pickOnDevice(supplier: string | null, line: string, candidates: Product[]): Promise<Product | null> {
   if (!candidates.length) return null;
+  if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
   const r = await model.generateContent(pickPrompt(supplier, line, candidates));
+  assertOnDevice(r);
   const n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
   return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;
 }

@@ -33,9 +33,9 @@ All AI calls go through **Firebase AI Logic**, protected by **App Check** (reCAP
 
 1. **Read on the device first.** If Chrome's built-in model (Gemini Nano) is available, Snap reads the photo on the device (`InferenceMode.ONLY_ON_DEVICE`, image input, JSON constrained to one schema).
 2. **Check the sums.** Every line must satisfy quantity × unit price = line total, and the lines must add up to the invoice total. A price is only trusted when another number on the page agrees with it (`src/invoice.ts`).
-3. **Send to the cloud only when needed.** If the device's read does not add up, or the device cannot read at all, the same photo goes to `gemini-3.5-flash-lite` (`InferenceMode.ONLY_IN_CLOUD`). If that read does not add up either, or the quick model is busy, `gemini-3.6-flash` reads it again; busy errors are retried twice first, and every call has a time limit after which it is cancelled. The screen says which reader produced the result, how long it took, why it moved to the cloud, and what the cloud reads would cost at Google's paid rates.
+3. **Send to the cloud only when needed.** If the device's read does not add up, found no prices at all, or the device cannot read, the same photo goes to `gemini-3.5-flash-lite` (`InferenceMode.ONLY_IN_CLOUD`). If that read does not add up either, or the quick model is busy, `gemini-3.6-flash` reads it again; busy errors are retried twice first, and every cloud call has a time limit after which it is cancelled (the on-device model cannot be cancelled through the SDK, so after a timeout Snap stops using it for the rest of the visit). The screen says which reader produced the result, how long it took, why it moved to the cloud, and what the cloud reads would cost at Google's paid rates.
 4. **Never "fix" the paper.** Both readers are told to copy numbers exactly, even when the paper's arithmetic is wrong. When two reads find the same numbers and they still do not add up, the mistake is on the invoice itself, and Snap says so: a supplier's adding error is money the shop would otherwise lose. When the two reads disagree, Snap shows the read that adds up and marks every disputed number, with the other read beside it, for the owner to check against the paper (`reconcile` in `src/invoice.ts`).
-5. **Keep the private work on the device.** The shop's product list, selling prices and each supplier's shorthand live in the browser (IndexedDB) and are never uploaded. When plain name matching is unsure, the on-device model picks the matching product. That step has no cloud fallback, on purpose.
+5. **Keep the private work on the device.** The shop's product list, selling prices and each supplier's shorthand live in the browser (IndexedDB) and are never uploaded. When plain name matching is unsure, the on-device model picks the matching product. That step has no cloud fallback, on purpose: the code checks that Chrome's model is present before asking (without it, the SDK would answer an on-device request from the cloud) and that the answer really came from the device.
 
 What we measured on real invoices (14 to 16 November 2026, Chrome's on-device model on a 4-core CPU):
 
@@ -61,7 +61,7 @@ You need Node 20+ and a Firebase project on the free Spark plan with:
 ```bash
 npm install
 cp .env.example .env.local      # fill in your project's web config and reCAPTCHA site key
-# put VITE_APPCHECK_DEBUG_TOKEN=<your debug token> in .env.development.local
+# put VITE_APPCHECK_DEBUG_TOKEN=<your debug token> in .env.development.local (development builds only)
 npm run dev                     # http://localhost:5173
 npm test                        # unit tests: sum check, reconciling reads, matching, export, cost
 ```

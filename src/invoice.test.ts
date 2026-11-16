@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers } from "./invoice";
+import { checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers, trustDeviceRead } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -46,6 +46,20 @@ describe("checkSums", () => {
   it("catches quantity times price that does not match the line total", () => {
     const c = checkSums(normalize({ items: [{ quantity: 2, description: "Milo 400g", unit_price: 3500, line_total: 6000 }], total: 6000 }));
     expect(c.problems).toEqual(["Line 1: 2 × ₦3,500 is ₦7,000, not ₦6,000."]);
+  });
+
+  it("catches a ₦2,000 adding error on a ₦2.4 million invoice, but allows one naira of rounding", () => {
+    const big = { supplier: null, items: [{ quantity: 1, description: "Laptops", unit_price: 2363000, line_total: 2363000 }], total: 2365000 };
+    expect(checkSums(normalize(big)).ok).toBe(false);
+    expect(checkSums(normalize({ ...big, total: 2363001 })).ok).toBe(true);
+    expect(checkSums(normalize({ supplier: null, items: [{ quantity: 1.5, description: "Rice", unit_price: 3333, line_total: 5000 }], total: 5000 })).ok).toBe(true);
+  });
+
+  it("does not trust an on-device read that found no prices on the paper", () => {
+    const noPrices = checkSums(normalize({ items: [{ quantity: 2, description: "Sugar", unit_price: null, line_total: null }], total: null }));
+    expect(noPrices.ok && noPrices.crossChecked).toBe(true);
+    expect(trustDeviceRead(noPrices)).toBe(false);
+    expect(trustDeviceRead(checkSums(normalize(cloudRising)))).toBe(true);
   });
 
   it("rejects an empty read", () => {
