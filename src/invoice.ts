@@ -119,7 +119,7 @@ const KINDS: [Kind, RegExp][] = [
   ["withholding", /withholding|\bwht\b/i],
   ["vat", /(?<![a-z])v\.?\s?a\.?\s?t(?![a-z])|\btax|levy|\bduty/i], // "VAT7.5%" and "V.A.T" too
   ["delivery", /deliver|transport|freight|carriage|haulage|logistic|loading|shipping|courier|dispatch/i],
-  ["discount", /discount|\bdisc\b|rebate|credit|refund|allowance/i],
+  ["discount", /discount|\bdisc\b|rebate|\bcredit(?!\s*card)|refund|allowance/i], // a "Credit card charge" is a fee
   ["brought", /b\/f|brought|previous|\bold\b|arrears/i],
   ["fee", /fee|charge|commission|surcharge|service|pack(ag)?ing|insurance|handling|labou?r|installation/i],
   ["payment", /\bpaid\b|payment|deposit|advance|\bcash\b|tender|received|\bchange\b|transfer|\bpos\b/i],

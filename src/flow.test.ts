@@ -216,6 +216,23 @@ describe("settle: never blamed, never cleared on a guess", () => {
     expect(t.invoice.charges).toEqual([{ label: "Discount", amount: -5000, unsure: true }]);
   });
 
+  it("keeps the doubt a row's name carries when another read gave the row no name", async () => {
+    // VAT taken off the total: the full reads call the row "7.5%", the charges read "VAT 7.5%".
+    const noName = { label: "7.5%", amount: -7500 };
+    const s = await settle(generator(92500, noName), readers({ again: generator(92500, noName), charges: [{ label: "VAT 7.5%", amount: 7500 }] }).r);
+    expect(s.invoice.charges).toEqual([{ label: "VAT 7.5%", amount: -7500, unsure: true }]);
+    expect(s.disputes?.[0].note).toMatch(/^VAT 7\.5% -₦7,500 is taken off, but its label reads like something added/);
+    // A payment added to the total, named only by the charges read.
+    const t = await settle(generator(105000, { label: "Others", amount: 5000 }), readers({ charges: [{ label: "Amount paid", amount: 5000 }] }).r);
+    expect(t.invoice.charges).toEqual([{ label: "Amount paid", amount: 5000, unsure: true }]);
+    // An unnamed row never joins a delivery line to a payment of the same size.
+    const fulls = [generator(105000, { label: "Others", amount: 5000 }), generator(105000, { label: "Delivery", amount: 5000 })];
+    const r = resolve(fulls[0], fulls, [{ label: "Amount paid", amount: 5000 }]);
+    expect(r.verdict).toBe("adds-if");
+    expect(r.invoice.charges).toEqual([{ label: "Delivery", amount: 5000, unsure: true }]);
+    expect(r.invoice.notCounted).toEqual([{ label: "Amount paid", amount: 5000 }]);
+  });
+
   it("never blames a total that adds something to a subtotal equal to the lines", async () => {
     const sub = { label: "Subtotal", amount: 100000 };
     const inv = generator(107500, sub); // the VAT line between them was missed by every read

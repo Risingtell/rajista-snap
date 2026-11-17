@@ -93,6 +93,9 @@ export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Se
         (x) => !used.has(x) && Math.abs(Math.abs(x.row.amount) - Math.abs(row.amount)) <= 1 && sameKind(x.row.label, row.label),
       );
       if (!s) seen.push((s = { row: { label: row.label, amount: row.amount }, fulls: 0, narrow: false }));
+      // One read named the row ("VAT 7.5%") where another did not ("7.5%"): the name is kept, so the doubt it carries
+      // still counts, and a row named one kind is never matched with a row of another through an unnamed one.
+      else if (kindOf(s.row.label) === null && kindOf(row.label) !== null) s.row = { label: row.label, amount: s.row.amount };
       used.add(s);
       mark(s);
     }
