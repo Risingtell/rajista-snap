@@ -26,6 +26,8 @@ import {
   looksLikeCharge,
   MAX_ROWS,
   naira,
+  rowAmounts,
+  rowKind,
   sameLines,
   sameRow,
   type Charge,
@@ -69,13 +71,19 @@ const LINE_ADVICE = " Check these numbers against the paper: if they match, the 
 /** An extra row seen on the invoice, and which reads found it. */
 type Seen = { row: Charge; fulls: number; narrow: boolean };
 
-/** Every distinct extra row across the full reads and the charges read, matched by amount (to the naira, either sign). */
+/**
+ * Every distinct extra row across the full reads and the charges read. Two reads' rows are the same row when they are
+ * the same kind (VAT, a discount, a deposit, a payment...) and the same amount to the naira, whatever sign was written:
+ * so a delivery line the charges read found never vouches for a discount a full read made up.
+ */
 export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Seen[] {
   const seen: Seen[] = [];
   const add = (rows: Charge[], mark: (s: Seen) => void) => {
     const used = new Set<Seen>();
     for (const row of rows) {
-      let s = seen.find((x) => !used.has(x) && Math.abs(Math.abs(x.row.amount) - Math.abs(row.amount)) <= 1);
+      let s = seen.find(
+        (x) => !used.has(x) && rowKind(x.row.label) === rowKind(row.label) && Math.abs(Math.abs(x.row.amount) - Math.abs(row.amount)) <= 1,
+      );
       if (!s) seen.push((s = { row: { label: row.label, amount: row.amount }, fulls: 0, narrow: false }));
       used.add(s);
       mark(s);
@@ -98,8 +106,9 @@ export type Resolved = {
 
 /**
  * The shown lines and total, with the extra rows the total includes, weighed across every read: first only rows the
- * charges read found; then also rows only full reads found, which are marked unsure. When no choice adds up, the rows
- * the charges read found that read like charges are shown (without a charges read, the shown read's own).
+ * charges read found; then also rows only full reads found, which are marked unsure. When no choice adds up, every row
+ * any read saw that reads like a charge is shown (as its kind counts it), the ones the charges read did not find marked
+ * unsure, so the gap on screen is the real one.
  */
 export function resolve(shown: Invoice, fulls: Invoice[], narrow: Charge[] | null | undefined): Resolved {
   if (shown.total === null || shown.items.length === 0 || !allPriced(shown)) return { invoice: shown, adds: true, unsure: [], capped: false };
@@ -122,7 +131,12 @@ export function resolve(shown: Invoice, fulls: Invoice[], narrow: Charge[] | nul
   if (confirmed) return make(confirmed, true);
   const any = addingSubset(lines, shown.total, all);
   if (any) return make(any, true, any.filter((c) => !witnessed.some((w) => sameRow(w, c))));
-  return make(narrow ? witnessed.filter((r) => looksLikeCharge(r.label)) : (shown.charges ?? []), false);
+  const shownRows = all.filter((r) => looksLikeCharge(r.label)).map((r) => ({ ...r, amount: rowAmounts(r)[0] }));
+  return make(
+    shownRows,
+    false,
+    shownRows.filter((c) => !witnessed.some((w) => sameRow(w, c))),
+  );
 }
 
 export async function settle(first: Invoice, read: Readers, opts: SettleOptions = {}): Promise<Settled> {
@@ -152,20 +166,26 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
     const one = r.unsure.length === 1;
     const list = r.unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ");
     const why = n === null ? "could not be checked (reading the charges on their own failed)" : `${one ? "was" : "were"} not found when the charges were read on their own`;
-    const note = `${list} ${why}, so ${one ? "it is" : "they are"} marked in orange. With ${one ? "it" : "them"}, the total adds up; without, the lines and other charges come to ${naira(linesTotal(r.invoice) + without)} and the total says ${naira(r.invoice.total)}.`;
+    const after = r.adds
+      ? `With ${one ? "it" : "them"}, the total adds up; without, the lines and other charges come to ${naira(linesTotal(r.invoice) + without)} and the total says ${naira(r.invoice.total)}.`
+      : `Even with ${one ? "it" : "them"}, the total does not add up.`;
+    const note = `${list} ${why}, so ${one ? "it is" : "they are"} marked in orange. ${after}`;
     return { line: null, field: "charges", shown: total, other: without, note };
   };
 
   /** The answer for the shown lines and total, with every read's extra rows weighed. */
-  const finish = (shown: Invoice, how: { twice: boolean; totalAgain?: boolean; disputes?: Dispute[] }): Settled => {
+  const finish = (shown: Invoice, how: { twice: boolean; totalAgain?: boolean; strongAgreed?: boolean; disputes?: Dispute[] }): Settled => {
     const r = resolve(shown, fulls, n);
     const out = [...(how.disputes ?? [])];
     let paperError: string | undefined;
-    if (r.unsure.length) out.push(unsureDispute(r));
+    // Without a charges read, a total that does not add up gets one plain note below instead of row-by-row notes.
+    if (r.unsure.length && !(!r.adds && n === null)) out.push(unsureDispute(r));
     if (how.twice) {
       const twiceSaid = how.totalAgain
         ? `The total was read again on its own and came back as ${naira(shown.total)} again.`
-        : "Snap read the photo twice and got the same numbers both times.";
+        : how.strongAgreed
+          ? "Two of three reads, one by a stronger model, found the same numbers."
+          : "Snap read the photo twice and got the same numbers both times.";
       const lineErrors = checkSums({ ...r.invoice, total: null }).problems.filter((p) => p.startsWith("Line "));
       if (!r.adds && n && !r.capped) paperError = `${checkSums(r.invoice).problems.join(" ")} ${twiceSaid}${PAPER_ADVICE}`;
       else if (lineErrors.length) paperError = `${lineErrors.join(" ")} ${twiceSaid}${LINE_ADVICE}`;
@@ -195,7 +215,7 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
 
   // 1. The first read. If it adds up only with extra rows, the charges are read on their own.
   let r = resolve(first, fulls, n);
-  if (r.unsure.length) {
+  if (r.adds && r.unsure.length) {
     await readCharges();
     steps.push(
       n === null
@@ -257,7 +277,7 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
     const third = await read.strong();
     fulls.push(third);
     const agrees = [second, first].find((x) => sameLines(x, third) && x.total === third.total);
-    if (agrees) return finish(names(third, agrees), { twice: true });
+    if (agrees) return finish(names(third, agrees), { twice: true, strongAgreed: true });
     return showOne(pick(first, second), third);
   } catch (e) {
     steps.push(`The stronger model could not help (${why(e)}).`);

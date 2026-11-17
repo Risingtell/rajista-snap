@@ -11,6 +11,9 @@ let picksOff = false;
 /** True once a pick ran past its time limit: this computer is too slow to match products on the device. */
 export const devicePicksOff = () => picksOff;
 
+/** This line's on-device prompt failed: leave the line undecided (it is tried again after the next reading). */
+export class PickSkipped extends Error {}
+
 const PICK_SESSION: LanguageModelCreateOptions = { expectedOutputs: [{ type: "text", languages: ["en"] }] };
 const PICK_SCHEMA = { type: "object", properties: { choice: { type: "integer" } }, required: ["choice"] } as const;
 
@@ -52,7 +55,7 @@ export async function pickOnDevice(supplier: string | null, line: string, candid
         throw e;
       }
       if (queue.aborted || (e as Error)?.name === "AbortError") throw e; // a reading needs the device: stop for now
-      return null; // this line's prompt failed: no pick for it, and the next line is tried
+      throw new PickSkipped(m);
     }
   });
 }

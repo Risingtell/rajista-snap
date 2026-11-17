@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolve, settle, type Readers } from "./flow";
-import { arrange, type Charge, type Invoice, type Line } from "./invoice";
+import { arrange, normalize, type Charge, type Invoice, type Line } from "./invoice";
 
 const line = (quantity: number, description: string, unit: number, total: number): Line => ({ quantity, description, unit_price: unit, line_total: total });
 /** A read as normalize() would return it: its extra rows arranged by its own arithmetic. */
@@ -261,14 +261,14 @@ describe("settle", () => {
     const { r, calls } = readers({ again: misread, strong: paper, charges: [] });
     const s = await settle(paper, r);
     expect(calls.strong).toBe(1);
-    expect(s.paperError).toMatch(/Snap read the photo twice/);
+    expect(s.paperError).toMatch(/Two of three reads, one by a stronger model, found the same numbers\./);
   });
 
   it("confirms the mistake when the stronger model agrees with either quick read", async () => {
     const corrected = read({ ...paper, items: [line(2, "Sugar", 30000, 59500), ...lines.slice(1)] }); // "fixed" to add up
     const { r } = readers({ again: corrected, strong: paper, charges: [] });
     const s = await settle(paper, r);
-    expect(s.paperError).toMatch(/Snap read the photo twice/);
+    expect(s.paperError).toMatch(/Two of three reads, one by a stronger model, found the same numbers\./);
     expect(s.invoice.items[0].line_total).toBe(60000);
   });
 
@@ -292,6 +292,46 @@ describe("settle", () => {
     const empty = read({ supplier: null, items: [], total: null });
     const s = await settle(paper, readers({ again: empty, strong: new Error("busy"), charges: [] }).r);
     expect(s.invoice.items).toHaveLength(3);
+  });
+
+  it("flags a supplier who added a discount instead of taking it off", async () => {
+    const plus = { label: "Discount", amount: 3000 };
+    const wrong = read({ supplier: "Tasiu", items: [line(1, "Generator", 100000, 100000)], total: 103000 }, plus);
+    const s = await settle(wrong, readers({ again: wrong, charges: [{ label: "Discount", amount: -3000 }] }).r);
+    expect(s.paperError).toMatch(/^The lines and charges add up to ₦97,000, but the invoice total says ₦103,000\./);
+  });
+
+  it("counts a crate deposit however its sign was written", async () => {
+    const minus = { label: "Crate deposit", amount: -2000 };
+    const drinks = read({ supplier: "NBC", items: [line(10, "Crate of Coke", 5000, 50000)], total: 52000 }, minus);
+    const s = await settle(drinks, readers({ charges: [{ label: "Crate deposit", amount: 2000 }] }).r);
+    expect(s.invoice.charges).toEqual([{ label: "Crate deposit", amount: 2000 }]);
+    expect(s.paperError).toBeUndefined();
+    expect(s.disputes).toBeUndefined();
+  });
+
+  it("never lets a delivery line vouch for a discount of the same size", async () => {
+    const invented = { label: "Discount", amount: -3000 };
+    const made = read({ supplier: "Tasiu", items: [line(1, "Generator", 100000, 100000)], total: 97000 }, invented);
+    const s = await settle(made, readers({ again: made, charges: [{ label: "Delivery", amount: 3000 }] }).r);
+    expect(s.invoice.charges).toEqual([{ ...invented, unsure: true }]);
+    expect(s.paperError).toBeUndefined();
+  });
+
+  it("shows, and marks, a VAT line only the full reads found when nothing adds up, so the gap shown is the real one", async () => {
+    const wrongTotal = read({ supplier: "Tasiu", items: goods, total: 175000 }, vat); // ₦160,000 + ₦12,000 is not ₦175,000
+    const s = await settle(wrongTotal, readers({ again: wrongTotal, charges: [] }).r);
+    expect(s.invoice.charges).toEqual([{ ...vat, unsure: true }]);
+    expect(s.paperError).toMatch(/^The lines and charges add up to ₦172,000, but the invoice total says ₦175,000\./);
+    expect(s.disputes?.[0].note).toMatch(/Even with it, the total does not add up\.$/);
+  });
+
+  it("never blames the supplier for a quantity nobody wrote", async () => {
+    const noQty = { supplier: "Tasiu", items: [{ quantity: null, description: "Rice 50kg", unit_price: 25000, line_total: 70000 }], total: 70000 };
+    const smudged = normalize(noQty);
+    expect(smudged.items[0]).toMatchObject({ quantity: 1, guessed: true });
+    const s = await settle(smudged, readers({ again: normalize(noQty), charges: [] }).r);
+    expect(s.paperError).toBeUndefined();
   });
 
   it("makes no second read when the first came from the stronger model", async () => {

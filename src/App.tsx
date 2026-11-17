@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
 import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
-import { devicePicksOff, pickOnDevice } from "./devicematch";
+import { devicePicksOff, pickOnDevice, PickSkipped } from "./devicematch";
 import { aliasKey, isAliasOf, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
@@ -164,6 +164,7 @@ export function App() {
     const inv = reading.invoice;
     let stop = false;
     (async () => {
+      let skippedInARow = 0;
       for (let i = 0; i < inv.items.length && !stop; i++) {
         if (busyRef.current || deviceReadWaiting()) return;
         const key = aliasKey(inv.supplier, inv.items[i].description);
@@ -177,9 +178,12 @@ export function App() {
         let id: string;
         try {
           id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
-        } catch {
-          // The device could not answer (a reading took it, it is busy or too slow): stop, and leave the lines
-          // undecided so the owner picks, or the device tries again after the next reading.
+          skippedInARow = 0;
+        } catch (e) {
+          // One line's prompt failed: leave it undecided and try the next, unless that happens twice in a row. Anything
+          // else means the device cannot answer now (a reading took it, it is busy or too slow): stop, leaving the
+          // lines undecided, so the owner picks or the device tries again after the next reading.
+          if (e instanceof PickSkipped && ++skippedInARow < 2) continue;
           return;
         }
         if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
@@ -418,7 +422,7 @@ export function App() {
                   </tr>
                 </tfoot>
               </table>
-              <p className={check.ok && !reading.disputes && !check.notes.length ? "sums ok" : "sums bad"}>
+              <p className={check.ok && check.crossChecked && !reading.disputes && !check.notes.length ? "sums ok" : "sums bad"}>
                 {!check.ok
                   ? check.problems.join(" ")
                   : !check.hasPrices
@@ -431,7 +435,11 @@ export function App() {
                           : "Adds up as shown, but check the charges (VAT, delivery or a discount) against the paper."
                       : check.notes.length
                         ? "Adds up, but check the note below."
-                        : "✓ Everything adds up."}
+                        : !check.crossChecked
+                          ? invoice.total === null
+                            ? "No total on this paper to check the prices against."
+                            : "Some lines have no price, so the total could not be checked."
+                          : "✓ Everything adds up."}
               </p>
               {check.notes.length > 0 && <p className="notes">{check.notes.join(" ")}</p>}
               <div className="actions">
@@ -588,18 +596,12 @@ function DisputesNote({ disputes, invoice }: { disputes: Dispute[]; invoice: Inv
   const charges = disputes.find((d) => d.field === "charges");
   const twoReads = disputes.some((d) => d.field !== "charges");
   const unsure = (invoice.charges ?? []).filter((c) => c.unsure);
-  const chargeRows = unsure.length > 0;
   return (
     <div className="disputes" role="status">
       <b>Check this invoice against the paper.</b>
       {twoReads && " Two cloud reads disagreed."}
       {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
-      {charges &&
-        (charges.note
-          ? ` ${charges.note}`
-          : chargeRows
-            ? ` ${unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ")} could not be confirmed, so ${unsure.length === 1 ? "it is" : "they are"} marked in orange.`
-            : ` The charges (VAT, delivery or a discount) came to ${naira(charges.shown, "₦0")} in one read and ${naira(charges.other, "₦0")} in another.`)}
+      {charges && ` ${charges.note ?? `${unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ") || "The charges"} could not be confirmed.`}`}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>
   );

@@ -6,6 +6,8 @@ export type Line = {
   description: string;
   unit_price: number | null; // naira
   line_total: number | null; // naira
+  /** No quantity was written (or it could not be read): Snap took it from the line, and the owner checks it. */
+  guessed?: true;
 };
 
 /** An amount on the paper that is not a product: VAT, delivery, transport, a deposit, or a discount (negative). */
@@ -136,16 +138,58 @@ export const linesTotal = (inv: Pick<Invoice, "items">) =>
 
 /** At most this many extra rows are tried; beyond it the paper is never blamed (see src/flow.ts). */
 export const MAX_ROWS = 12;
-const TAKEN_OFF = /discount|rebate|\bless\b|paid|payment|deposit|advance|credit|refund/i;
 
 /**
- * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. Each row is counted
- * as read, left out, or, for a discount or payment written without a minus sign, taken off (returned with its amount
- * negated). When several choices work, the one with the most rows that read like charges, and the fewest that read
- * like sums or payments, wins; then the one that changes fewer signs; then the one with fewer rows.
+ * What kind of extra row a label names. Two reads' rows are the same row only if they are the same kind and amount,
+ * and the kind, not the sign a reader wrote, decides how a row can count: a discount or payment always comes off, VAT
+ * or delivery is always added, and a deposit can be either (a crate deposit is added; "less deposit" is taken off).
+ */
+export type RowKind = "tax" | "off" | "deposit" | "paid" | "carriage" | "balance" | "sum" | "fee" | "other";
+export function rowKind(label: string): RowKind {
+  const l = label.toLowerCase();
+  if (/vat|tax|levy/.test(l)) return "tax";
+  if (/discount|rebate|\bless\b|credit|refund/.test(l)) return "off";
+  if (/deposit/.test(l)) return "deposit";
+  if (/paid|payment|advance|\bcash\b|\bchange\b/.test(l)) return "paid";
+  if (/deliver|transport|freight|carriage|loading/.test(l)) return "carriage";
+  if (/balance|\bbal\b|b\/f|c\/f|forward/.test(l)) return "balance";
+  if (/total/.test(l)) return "sum";
+  if (/fee|commission|surcharge|charge/.test(l)) return "fee";
+  return "other";
+}
+
+/** The amounts a row can add to the total: taken off, added, either, or (a row of unknown kind) as written. */
+export function rowAmounts(r: Charge): number[] {
+  const a = Math.abs(r.amount);
+  switch (rowKind(r.label)) {
+    case "off":
+    case "paid":
+      return [-a];
+    case "deposit":
+      return [a, -a];
+    case "tax":
+    case "carriage":
+    case "fee":
+      return [a];
+    default:
+      return [r.amount];
+  }
+}
+
+/**
+ * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. Each row is left
+ * out or counted in one of the ways its kind allows (rowAmounts), and returned with the amount it counts for. When
+ * several choices work, the one with the most rows that read like charges, and the fewest that read like sums or
+ * payments, wins; then the one with fewer rows.
  */
 export function addingSubset(lines: number, total: number, rows: Charge[]): Charge[] | null {
-  const list = rows.slice(0, MAX_ROWS);
+  // Worked out once per row, not at every step of the search.
+  const list = rows.slice(0, MAX_ROWS).map((r) => ({
+    r,
+    amounts: rowAmounts(r),
+    // A charge-like row counts for; a "total" label (a summary of others) slightly less; a sum or payment against.
+    weight: looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200,
+  }));
   const found: { best: { set: Charge[]; score: number } | null } = { best: null };
   const set: Charge[] = [];
   const walk = (i: number, sum: number, score: number) => {
@@ -154,18 +198,13 @@ export function addingSubset(lines: number, total: number, rows: Charge[]): Char
       if (Math.abs(lines + sum - total) <= 1 && (!found.best || s > found.best.score)) found.best = { set: [...set], score: s };
       return;
     }
-    walk(i + 1, sum, score); // left out
-    const r = list[i];
-    // A charge-like row counts for; a "total" label (a summary of others) slightly less; a sum or payment against.
-    const weight = looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200;
-    set.push(r);
-    walk(i + 1, sum + r.amount, score + weight);
-    set.pop();
-    if (r.amount > 0 && TAKEN_OFF.test(r.label)) {
-      set.push({ ...r, amount: -r.amount });
-      walk(i + 1, sum - r.amount, score + weight - 10);
+    const { r, amounts, weight } = list[i];
+    for (const amount of amounts) {
+      set.push(amount === r.amount ? r : { ...r, amount });
+      walk(i + 1, sum + amount, score + weight);
       set.pop();
     }
+    walk(i + 1, sum, score); // left out
   };
   walk(0, 0, 0);
   return found.best ? found.best.set : null;
@@ -191,12 +230,15 @@ export function normalize(raw: unknown): Invoice {
   const items: Line[] = o.items
     .map((it) => {
       const r = (it ?? {}) as Record<string, unknown>;
-      return {
-        quantity: num(r.quantity) ?? 1,
-        description: String(r.description ?? "").replace(/\s+/g, " ").trim(),
-        unit_price: num(r.unit_price),
-        line_total: num(r.line_total),
-      };
+      const quantity = num(r.quantity);
+      const unit_price = num(r.unit_price);
+      const line_total = num(r.line_total);
+      const description = String(r.description ?? "").replace(/\s+/g, " ").trim();
+      if (quantity !== null) return { quantity, description, unit_price, line_total };
+      // No quantity: the line total over the unit price, when that is a whole number of pieces; otherwise one.
+      const pieces = unit_price && line_total !== null ? line_total / unit_price : NaN;
+      const whole = Math.round(pieces);
+      return { quantity: whole >= 1 && Math.abs(pieces - whole) < 0.001 ? whole : 1, description, unit_price, line_total, guessed: true as const };
     })
     .filter((l) => l.description);
   const total = num(o.total);
@@ -252,9 +294,10 @@ export function checkSums(inv: Invoice): Check {
   let sum = 0;
   let allTotals = true;
   inv.items.forEach((l, i) => {
+    if (l.guessed) notes.push(`Line ${i + 1}: no quantity was written, so Snap took it as ${l.quantity}; check it.`);
     if (l.quantity <= 0) problems.push(`Line ${i + 1}: the quantity ${l.quantity} cannot be right.`);
     const lineTotal = l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : null);
-    if (l.unit_price !== null && l.line_total !== null && l.quantity > 0) {
+    if (l.unit_price !== null && l.line_total !== null && l.quantity > 0 && !l.guessed) {
       const product = l.quantity * l.unit_price;
       const gap = l.line_total - product;
       if (Math.abs(gap) > 1) {

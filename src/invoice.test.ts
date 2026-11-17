@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addingSubset, arrange, CHARGES_PROMPT, chargesFrom, checkSums, disputes, looksLikeCharge, naira, normalize, sameLines, trustDeviceRead } from "./invoice";
+import { addingSubset, arrange, rowAmounts, rowKind, CHARGES_PROMPT, chargesFrom, checkSums, disputes, looksLikeCharge, naira, normalize, sameLines, trustDeviceRead } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -225,5 +225,43 @@ describe("extra rows (VAT, delivery, deposits, subtotals, payments)", () => {
 
   it("asks the charges-only read for charges, without adding anything up", () => {
     expect(CHARGES_PROMPT).toMatch(/Do not add anything up/);
+  });
+});
+
+describe("row kinds", () => {
+  it("decide how a row can count, whatever sign a reader wrote", () => {
+    expect(rowKind("VAT 7.5%")).toBe("tax");
+    expect(rowKind("Total VAT")).toBe("tax");
+    expect(rowKind("Cash discount")).toBe("off");
+    expect(rowKind("Less: Deposit")).toBe("off");
+    expect(rowKind("Crate deposit")).toBe("deposit");
+    expect(rowKind("Amount paid")).toBe("paid");
+    expect(rowKind("Transport")).toBe("carriage");
+    expect(rowKind("Previous balance")).toBe("balance");
+    expect(rowKind("SUBTOTAL")).toBe("sum");
+    expect(rowAmounts({ label: "Discount", amount: 3000 })).toEqual([-3000]);
+    expect(rowAmounts({ label: "VAT", amount: -12000 })).toEqual([12000]);
+    expect(rowAmounts({ label: "Crate deposit", amount: -2000 })).toEqual([2000, -2000]);
+    expect(rowAmounts({ label: "Something", amount: -50 })).toEqual([-50]);
+  });
+
+  it("never adds a discount, and counts a deposit either way", () => {
+    expect(addingSubset(100000, 103000, [{ label: "Discount", amount: 3000 }])).toBeNull();
+    expect(addingSubset(100000, 97000, [{ label: "Discount", amount: 3000 }])).toEqual([{ label: "Discount", amount: -3000 }]);
+    expect(addingSubset(50000, 52000, [{ label: "Crate deposit", amount: -2000 }])).toEqual([{ label: "Crate deposit", amount: 2000 }]);
+    expect(addingSubset(100000, 70000, [{ label: "Less deposit", amount: 30000 }])).toEqual([{ label: "Less deposit", amount: -30000 }]);
+  });
+});
+
+describe("a quantity nobody wrote", () => {
+  it("is taken from the line when that gives whole pieces, noted, and never checked as an error", () => {
+    const inferred = normalize({ items: [{ quantity: null, description: "Rice 50kg", unit_price: 25000, line_total: 75000 }], total: 75000 });
+    expect(inferred.items[0]).toMatchObject({ quantity: 3, guessed: true });
+    const odd = normalize({ items: [{ description: "Rice 50kg", unit_price: 25000, line_total: 70000 }], total: 70000 });
+    expect(odd.items[0]).toMatchObject({ quantity: 1, guessed: true });
+    const c = checkSums(odd);
+    expect(c.ok).toBe(true);
+    expect(c.notes).toEqual(["Line 1: no quantity was written, so Snap took it as 1; check it."]);
+    expect(trustDeviceRead(c)).toBe(false);
   });
 });
