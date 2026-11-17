@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
 import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
-import { pickOnDevice } from "./devicematch";
-import { aliasKey, matchLine, type Product } from "./match";
+import { devicePicksOff, pickOnDevice } from "./devicematch";
+import { aliasKey, isAlias, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
@@ -160,7 +160,7 @@ export function App() {
   // reading (not on every keystroke), on the text as read, skips lines already decided, and stops as soon as a new
   // reading starts (readings get the on-device model first).
   useEffect(() => {
-    if (status !== "available" || deviceSlow() || !reading) return;
+    if (status !== "available" || deviceSlow() || devicePicksOff() || !reading) return;
     const inv = reading.invoice;
     let stop = false;
     (async () => {
@@ -178,8 +178,8 @@ export function App() {
         try {
           id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
         } catch {
-          /* no on-device answer (a reading took priority, or the model ran past its time limit): the owner picks */
-          if (deviceReadWaiting() || busyRef.current || deviceSlow()) return;
+          /* no on-device answer (a reading took the device, or picks are too slow here): the owner picks */
+          if (deviceReadWaiting() || busyRef.current || deviceSlow() || devicePicksOff()) return;
         }
         if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
       }
@@ -240,7 +240,7 @@ export function App() {
       if (cost !== null) p.lastCost = cost;
       if (prices[i] != null) p.sellPrice = prices[i]!;
       const key = aliasKey(invoice.supplier, l.description);
-      if (!p.aliases.includes(key)) {
+      if (!p.aliases.some((a) => isAlias(a, key))) {
         p.aliases.push(key);
         learned++;
       }
@@ -278,6 +278,7 @@ export function App() {
   const check = invoice ? checkSums(invoice) : null;
   /** What the other cloud read found for this number, when the two reads disagree on it. */
   const other = (line: number | null, field: Dispute["field"]) => reading?.disputes?.find((d) => d.line === line && d.field === field);
+  const chargesDisputed = !!reading?.disputes?.some((d) => d.field === "charges");
 
   return (
     <div className="shell">
@@ -395,6 +396,7 @@ export function App() {
                       <td className="num">
                         <MoneyInput
                           label={`${c.label}, amount`}
+                          flagged={chargesDisputed}
                           value={c.amount}
                           onChange={(v) =>
                             setInvoice({
@@ -416,7 +418,7 @@ export function App() {
                   </tr>
                 </tfoot>
               </table>
-              <p className={check.ok && !reading.disputes ? "sums ok" : "sums bad"}>
+              <p className={check.ok && !reading.disputes && !check.notes.length ? "sums ok" : "sums bad"}>
                 {!check.ok
                   ? check.problems.join(" ")
                   : !check.hasPrices
@@ -424,10 +426,14 @@ export function App() {
                     : reading.disputes
                       ? reading.disputes.some((d) => d.field !== "lines" && d.field !== "charges")
                         ? "Adds up as shown, but check the numbers marked in orange against the paper."
-                        : "Adds up as shown, but the two reads disagreed: check every line against the paper."
-                      : "✓ Everything adds up."}
+                        : reading.disputes.some((d) => d.field === "lines")
+                          ? "Adds up as shown, but the two reads disagreed: check every line against the paper."
+                          : "Adds up as shown, but check the charges (VAT, delivery or a discount) against the paper."
+                      : check.notes.length
+                        ? "Adds up, but check the note below."
+                        : "✓ Everything adds up."}
               </p>
-              {check.notes.length > 0 && <p className="private">{check.notes.join(" ")}</p>}
+              {check.notes.length > 0 && <p className="notes">{check.notes.join(" ")}</p>}
               <div className="actions">
                 <button className="primary" disabled={saving} onClick={saveAll}>
                   {saving ? "Saving…" : "Save to my products"}
@@ -580,11 +586,17 @@ function DisputesNote({ disputes }: { disputes: Dispute[] }) {
   const marked = disputes.filter((d) => d.field !== "lines" && d.field !== "charges").length;
   const lines = disputes.find((d) => d.field === "lines");
   const charges = disputes.find((d) => d.field === "charges");
+  const twoReads = disputes.some((d) => d.field !== "charges" || d.other !== null);
+  const chargeRows = charges !== undefined && charges.shown !== 0 && charges.shown !== null;
   return (
     <div className="disputes" role="status">
-      <b>Check this invoice against the paper.</b> Two cloud reads disagreed.
+      <b>Check this invoice against the paper.</b>
+      {twoReads && " Two cloud reads disagreed."}
       {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
-      {charges && ` Their charges (VAT, delivery, discounts) came to ${naira(charges.shown, "₦0")} and ${naira(charges.other, "₦0")}.`}
+      {charges &&
+        (charges.other === null
+          ? ` The charges (VAT, delivery or a discount) could not be read again on their own to confirm them${chargeRows ? ", so they are marked in orange" : ""}.`
+          : ` Their charges (VAT, delivery, discounts) came to ${naira(charges.shown, "₦0")} and ${naira(charges.other, "₦0")}${chargeRows ? ", marked in orange" : ""}.`)}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>
   );
@@ -618,7 +630,20 @@ function OtherRead({ d, plain }: { d?: Dispute; plain?: boolean }) {
   return <span className="other-read">other read: {d.other === null ? "blank" : plain ? d.other : naira(d.other)}</span>;
 }
 
-function MoneyInput({ label, value, onChange, dispute }: { label: string; value: number | null; onChange: (v: number | null) => void; dispute?: Dispute }) {
+function MoneyInput({
+  label,
+  value,
+  onChange,
+  dispute,
+  flagged,
+}: {
+  label: string;
+  value: number | null;
+  onChange: (v: number | null) => void;
+  dispute?: Dispute;
+  /** Marked for the owner to check, with no other read to show beside it. */
+  flagged?: boolean;
+}) {
   const [text, setText] = useState(value === null ? "" : value.toLocaleString("en-NG"));
   useEffect(() => setText(value === null ? "" : value.toLocaleString("en-NG")), [value]);
   return (
@@ -626,7 +651,7 @@ function MoneyInput({ label, value, onChange, dispute }: { label: string; value:
       <input
         aria-label={label}
         inputMode="numeric"
-        className={dispute ? "money disputed" : "money"}
+        className={dispute || flagged ? "money disputed" : "money"}
       value={text}
       placeholder="–"
       onChange={(e) => setText(e.target.value)}

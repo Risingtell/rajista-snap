@@ -2,26 +2,34 @@
 //
 //   1. If this browser has the on-device model, read the photo on the device.
 //   2. Check the sums (src/invoice.ts). Keep the on-device read only if another number on the page confirms it.
-//   3. Otherwise send the photo to the quick cloud model. If that read does not add up either, the quick model
-//      reads it a second time and the two reads are reconciled (src/invoice.ts): the same numbers twice means the
-//      paper itself is wrong; a dispute over the total alone is settled by one more, narrow read of the written
+//   3. Otherwise send the photo to the quick cloud model, and settle what it found (src/flow.ts): charges are read
+//      again on their own, a read that does not add up is read a second time, and the same numbers twice means the
+//      paper itself does not add up; a dispute over the total alone is settled by a narrow read of the written
 //      total; only a disagreement over the lines brings in the stronger (slower) model, and anything still unclear
 //      is shown to the owner to check.
 //
 // The shop owner sees which reader produced each invoice and why it moved to the cloud.
-import { getGenerativeModel, InferenceMode, InferenceSource, ThinkingLevel, type GenerateContentResult } from "firebase/ai";
-import { ai } from "./firebase";
 import {
+  getGenerativeModel,
+  InferenceMode,
+  InferenceSource,
+  ThinkingLevel,
+  type GenerateContentResult,
+  type LanguageModelCreateOptions,
+  type LanguageModelPromptOptions,
+} from "firebase/ai";
+import { ai } from "./firebase";
+import { settle } from "./flow";
+import {
+  CHARGES_JSON_SCHEMA,
+  CHARGES_PROMPT,
+  chargesFrom,
   checkSums,
-  sameLines,
   INVOICE_JSON_SCHEMA,
   normalize,
   READ_PROMPT,
-  reconcile,
-  settleTotal,
   TOTAL_JSON_SCHEMA,
   TOTAL_PROMPT,
-  totalOnlyDispute,
   trustDeviceRead,
   type Check,
   type Dispute,
@@ -32,15 +40,16 @@ import { CLOUD_MODEL, STRONG_MODEL } from "./models";
 
 export { CLOUD_MODEL, STRONG_MODEL };
 /**
- * Time limits, each covering a reader's retries too. A cloud call still running at its limit is cancelled. The
- * on-device model cannot be cancelled through the Firebase SDK, so Snap stops waiting for it and stops using it
- * for the rest of the visit (see deviceSlow), rather than piling more work onto a busy computer.
+ * Time limits, each covering a reader's retries too. A call still running at its limit is cancelled, on the device
+ * as in the cloud (see promptOnDevice). An on-device reading that runs past its limit also means this computer is
+ * too slow for it, so the rest of the visit reads in the cloud (see deviceSlow).
  */
 const DEVICE_TIMEOUT_MS = 90_000;
 const QUICK_TIMEOUT_MS = 50_000;
 // The stronger model answered in 12 s in the morning of 16 Nov and in 53 to 61 s that afternoon, so it gets more time.
 const STRONG_TIMEOUT_MS = 75_000;
 const TOTAL_TIMEOUT_MS = 30_000;
+const CHARGES_TIMEOUT_MS = 30_000;
 
 // Reading an invoice is copying, not reasoning: the stronger model runs with low thinking, which leaves it less room
 // to "fix" the paper's arithmetic.
@@ -55,6 +64,7 @@ const cloud = (model: string, schema: { [key: string]: unknown } = INVOICE_JSON_
 const cloudModel = cloud(CLOUD_MODEL);
 const strongModel = cloud(STRONG_MODEL, INVOICE_JSON_SCHEMA, ThinkingLevel.LOW);
 const totalModel = cloud(CLOUD_MODEL, TOTAL_JSON_SCHEMA);
+const chargesModel = cloud(CLOUD_MODEL, CHARGES_JSON_SCHEMA);
 type Model = typeof cloudModel;
 
 // ---- on-device model (Chrome's built-in Prompt API) ------------------------------------------------------
@@ -66,7 +76,7 @@ const lm = (): LM | undefined => (globalThis as unknown as { LanguageModel?: LM 
 export type DeviceStatus = "unsupported" | "unavailable" | "downloadable" | "downloading" | "available";
 const IMAGE_INPUT = { expectedInputs: [{ type: "image" }] };
 
-/** Set when the on-device model ran past its time limit: the rest of this visit reads in the cloud. */
+/** Set when an on-device reading ran past its time limit: the rest of this visit reads in the cloud. */
 let slow = false;
 export const deviceSlow = () => slow;
 
@@ -93,25 +103,55 @@ export async function downloadDeviceModel(onProgress: (fraction: number) => void
   s.destroy();
 }
 
-/**
- * Builds an ONLY_ON_DEVICE model after checking that Chrome's model is really present. The Firebase SDK decides
- * at creation time whether a device adapter exists, and without one it answers an ONLY_ON_DEVICE call from the
- * cloud. Creating the model here, after the check, means a private request can never be sent to the cloud.
- */
-const deviceModels = new Map<string, ReturnType<typeof getGenerativeModel>>();
-export async function onDeviceModel(key: string, params: Parameters<typeof getGenerativeModel>[1] & { mode: typeof InferenceMode.ONLY_ON_DEVICE }) {
-  if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
-  // One model per kind of prompt, reused: each holds one Chrome session and replaces it on the next call, so
-  // sessions do not pile up on a small machine.
-  let m = deviceModels.get(key);
-  if (!m) deviceModels.set(key, (m = getGenerativeModel(ai, params)));
-  return m;
-}
+// The last finished prompt's session stays open so Chrome keeps the model loaded for the next prompt; it is closed
+// when the next prompt finishes. A prompt that fails or is cancelled has its session closed at once.
+let keptSession: AbortController | null = null;
 
-/** Stops using the on-device model for the rest of the visit (it ran past a time limit and cannot be cancelled). */
-export const markDeviceSlow = () => {
-  slow = true;
-};
+/**
+ * One prompt on Chrome's on-device model, in a fresh session. The Firebase SDK passes createOptions to
+ * LanguageModel.create and promptOptions to session.prompt unchanged, so one abort signal in both cancels a running
+ * prompt and closes its session: a time-out, or a reading that needs the device, really frees it, and sessions never
+ * pile up. Any of `signals` cancels the prompt.
+ *
+ * Privacy: the model is built only after Chrome's model is confirmed present. The SDK decides at creation time
+ * whether a device adapter exists, and without one it would answer an ONLY_ON_DEVICE call from the cloud. The answer
+ * is also checked to have come from the device.
+ */
+export async function promptOnDevice(
+  createOptions: LanguageModelCreateOptions,
+  responseConstraint: object,
+  parts: Parameters<ReturnType<typeof getGenerativeModel>["generateContent"]>[0],
+  ...signals: AbortSignal[]
+): Promise<GenerateContentResult> {
+  const session = new AbortController();
+  const cancel = () => session.abort(new DOMException("The on-device prompt was cancelled.", "AbortError"));
+  for (const s of signals) {
+    if (s.aborted) cancel();
+    else s.addEventListener("abort", cancel, { once: true });
+  }
+  let kept = false;
+  try {
+    if (session.signal.aborted) throw session.signal.reason;
+    if ((await deviceStatus()) !== "available") throw new Error("The on-device model is not available.");
+    const model = getGenerativeModel(ai, {
+      mode: InferenceMode.ONLY_ON_DEVICE,
+      onDeviceParams: {
+        createOptions: { ...createOptions, signal: session.signal },
+        // Chrome's prompt() takes a signal too; the SDK's type leaves it out, but passes the options on unchanged.
+        promptOptions: { responseConstraint, signal: session.signal } as LanguageModelPromptOptions,
+      },
+    });
+    const r = await model.generateContent(parts);
+    assertOnDevice(r);
+    keptSession?.abort();
+    keptSession = session;
+    kept = true;
+    return r;
+  } finally {
+    for (const s of signals) s.removeEventListener("abort", cancel);
+    if (!kept) session.abort();
+  }
+}
 
 /** Throws if a call that was meant to stay on the device was answered in the cloud. */
 export function assertOnDevice(r: GenerateContentResult) {
@@ -121,6 +161,11 @@ export function assertOnDevice(r: GenerateContentResult) {
 // One on-device prompt at a time, readings first (src/devicequeue.ts).
 export { deviceReadWaiting, onDevice } from "./devicequeue";
 import { onDevice } from "./devicequeue";
+
+const READ_SESSION: LanguageModelCreateOptions = {
+  expectedInputs: [{ type: "image" }],
+  expectedOutputs: [{ type: "text", languages: ["en"] }],
+};
 
 // ---- reading ---------------------------------------------------------------------------------------------
 export type Attempt = { ms: number; invoice?: Invoice; check?: Check; error?: string };
@@ -141,7 +186,7 @@ export type Reading = {
 };
 
 /** Runs `fn` with a signal that is aborted after `ms`; rejects with a plain message then. The timer is always cleared. */
-function timed<T>(fn: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+export function timed<T>(fn: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const ctl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const limit = new Promise<never>((_, no) => {
@@ -153,8 +198,8 @@ function timed<T>(fn: (signal: AbortSignal) => Promise<T>, ms: number): Promise<
   return Promise.race([fn(ctl.signal), limit]).finally(() => clearTimeout(timer));
 }
 
-const ask = (model: Model, prompt: string, photo: Photo, signal: AbortSignal) =>
-  model.generateContent([prompt, { type: "inlineData", inlineData: { data: photo.base64, mimeType: photo.mimeType } }], { signal });
+const photoPart = (photo: Photo) => ({ type: "inlineData" as const, inlineData: { data: photo.base64, mimeType: photo.mimeType } });
+const ask = (model: Model, prompt: string, photo: Photo, signal: AbortSignal) => model.generateContent([prompt, photoPart(photo)], { signal });
 
 const message = (e: unknown) => String((e as Error)?.message ?? e);
 
@@ -219,20 +264,11 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     onStep("device");
     let t = performance.now();
     try {
-      const r = await onDevice(async () => {
-        // A product pick may have run past its time limit while this reading waited: Chrome is still busy with it.
-        if (slow) throw new Error("The on-device model ran past a time limit earlier in this visit.");
+      // A product match still running on the device is cancelled: readings come first.
+      const r = await onDevice((queue) => {
         t = performance.now(); // the time the device spent reading, not waiting for it
-        const model = await onDeviceModel("read", {
-          mode: InferenceMode.ONLY_ON_DEVICE,
-          onDeviceParams: {
-            createOptions: { expectedInputs: [{ type: "image" }], expectedOutputs: [{ type: "text", languages: ["en"] }] },
-            promptOptions: { responseConstraint: INVOICE_JSON_SCHEMA },
-          },
-        });
-        return timed((signal) => ask(model as Model, READ_PROMPT, photo, signal), DEVICE_TIMEOUT_MS);
-      }, true);
-      assertOnDevice(r);
+        return timed((limit) => promptOnDevice(READ_SESSION, INVOICE_JSON_SCHEMA, [READ_PROMPT, photoPart(photo)], queue, limit), DEVICE_TIMEOUT_MS);
+      }, "read");
       const invoice = normalize(r.response.text());
       const check = checkSums(invoice);
       device = { ms: Math.round(performance.now() - t), invoice, check };
@@ -247,11 +283,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     } catch (e) {
       if (/no answer after/.test(message(e))) slow = true;
       device = { ms: Math.round(performance.now() - t), error: message(e) };
-      whyCloud = slow
-        ? "The on-device model took too long, so the cloud read it."
-        : /device busy/.test(message(e))
-          ? "The on-device model was still busy matching products, so the cloud read it."
-          : "The on-device model could not read this photo.";
+      whyCloud = slow ? "The on-device model took too long, so the cloud read it." : "The on-device model could not read this photo.";
     }
   } else {
     whyCloud = status === "unsupported" ? "This browser has no on-device model." : "The on-device model is not ready on this computer.";
@@ -288,6 +320,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
   });
 
   let first: Invoice;
+  let fromStrong = false;
   try {
     first = await readWith(cloudModel, CLOUD_MODEL, QUICK_TIMEOUT_MS);
   } catch (e) {
@@ -296,65 +329,32 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     // The quick model is busy, unreachable, slow, or answered something unusable: the stronger model reads it.
     stepUp = STEP_UP_BECAUSE[f];
     onStep("cloud");
-    let strong: Invoice;
     try {
-      strong = await readWith(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
+      first = await readWith(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
     } catch (e2) {
       giveUp(e2);
     }
-    return finish(strong);
+    fromStrong = true;
   }
 
   // Local development only: add ?strong to the address to force the second read and test the steps after it.
-  const forceStrong = import.meta.env.DEV && typeof location !== "undefined" && new URLSearchParams(location.search).has("strong");
-  const firstCheck = checkSums(first);
-  if (firstCheck.ok && !firstCheck.hasCharges && !forceStrong) return finish(first);
-
-  // The quick read does not add up, or it adds up only with charges (which a reader could invent to close a gap):
-  // the quick model reads the photo a second time before anything is shown.
-  stepUp = !firstCheck.ok
-    ? `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.`
-    : firstCheck.hasCharges
-      ? "The read listed charges (VAT, delivery or a discount), so it was read a second time to confirm them."
-      : "It was read a second time (test mode).";
-  onStep("cloud");
-  let second: Invoice;
-  try {
-    second = await readWith(cloudModel, CLOUD_MODEL, QUICK_TIMEOUT_MS);
-  } catch (e) {
-    stepUp += ` The second read failed (${STRONG_FAILED_BECAUSE[failure(e)]}), so the first read is shown: please check it against the paper.`;
-    return finish(first);
-  }
-
-  if (totalOnlyDispute(first, second)) {
-    // Same lines, different totals, one of them adds up: read just the written total once more to settle it.
-    try {
-      const written = await call(totalModel, CLOUD_MODEL, TOTAL_PROMPT, TOTAL_TIMEOUT_MS, (r) => {
-        const v = (JSON.parse(r.response.text()) as { total?: unknown }).total;
-        return typeof v === "number" && Number.isFinite(v) ? v : null;
-      });
-      const s = settleTotal(first, second, written);
-      return finish(s.invoice, { paperError: s.paperError, disputes: s.disputes.length ? s.disputes : undefined });
-    } catch {
-      /* the narrow read failed: fall through and let the owner check the disputed total */
-    }
-  }
-
-  if (!sameLines(first, second)) {
-    // The two quick reads disagree on the lines themselves: the stronger model gives a third opinion.
-    stepUp += " The two reads disagreed on the lines, so a stronger model read it too.";
-    onStep("cloud");
-    try {
-      const third = await readWith(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS);
-      const better = checkSums(second).problems.length < checkSums(first).problems.length ? second : first;
-      const r = reconcile(better, third);
-      return finish(r.invoice, { paperError: r.paperError, disputes: r.disputes.length ? r.disputes : undefined });
-    } catch (e) {
-      stepUp += ` The stronger model could not help (${STRONG_FAILED_BECAUSE[failure(e)]}).`;
-    }
-  }
-  const r = reconcile(first, second);
-  return finish(r.invoice, { paperError: r.paperError, disputes: r.disputes.length ? r.disputes : undefined });
+  const forceSecond = import.meta.env.DEV && typeof location !== "undefined" && new URLSearchParams(location.search).has("strong");
+  const settled = await settle(
+    first,
+    {
+      again: () => (onStep("cloud"), readWith(cloudModel, CLOUD_MODEL, QUICK_TIMEOUT_MS)),
+      strong: () => (onStep("cloud"), readWith(strongModel, STRONG_MODEL, STRONG_TIMEOUT_MS)),
+      total: () =>
+        call(totalModel, CLOUD_MODEL, TOTAL_PROMPT, TOTAL_TIMEOUT_MS, (r) => {
+          const v = (JSON.parse(r.response.text()) as { total?: unknown }).total;
+          return typeof v === "number" && Number.isFinite(v) ? v : null;
+        }),
+      charges: () => call(chargesModel, CLOUD_MODEL, CHARGES_PROMPT, CHARGES_TIMEOUT_MS, (r) => chargesFrom(r.response.text())),
+    },
+    { secondRead: !fromStrong, forceSecond, why: (e) => STRONG_FAILED_BECAUSE[failure(e)] },
+  );
+  stepUp = [stepUp, ...settled.steps].filter(Boolean).join(" ") || undefined;
+  return finish(settled.invoice, { paperError: settled.paperError, disputes: settled.disputes });
 }
 
 /** Retries a cloud call that failed because the service was busy or briefly unreachable, twice, unless it was cancelled. */

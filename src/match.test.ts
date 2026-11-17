@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aliasKey, matchLine, similarity, words, type Product } from "./match";
+import { aliasKey, isAlias, matchLine, similarity, words, type Product } from "./match";
 
 const p = (id: string, name: string, aliases: string[] = []): Product => ({ id, name, sellPrice: null, lastCost: null, aliases });
 const shop = [
@@ -52,6 +52,21 @@ describe("matchLine", () => {
   it("recognises the same supplier however the reader spaced or capitalised the name", () => {
     expect(aliasKey("Rising Technology", "Ctn Peak Tin 160g")).toBe(aliasKey("RisingTechnology", "ctn. Peak Tin 160g"));
     expect(aliasKey("RISING TECHNOLOGY.", "Peak")).toBe(aliasKey("rising technology", "Peak"));
+  });
+
+  it("ignores accents but keeps names in other scripts apart from a missing supplier", () => {
+    expect(aliasKey("Ọlá Stores", "Peak")).toBe(aliasKey("Ola Stores", "Peak"));
+    const arabic = aliasKey("محلات موسى", "Peak"); // a name in Arabic script
+    expect(arabic).not.toBe(aliasKey(null, "Peak"));
+    expect(arabic).not.toBe(aliasKey("محلات", "Peak"));
+  });
+
+  it("still recognises aliases saved in the older format", () => {
+    const old = "rising technology|carton peak tin 160g"; // saved before 16 Nov 2026
+    expect(isAlias(old, aliasKey("RisingTechnology", "Ctn. Peak Tin 160g"))).toBe(true);
+    expect(isAlias(old, aliasKey("Other Supplier", "Ctn. Peak Tin 160g"))).toBe(false);
+    const shop = [p("peak", "Peak Milk Tin 160g", [old])];
+    expect(matchLine("Rising Technology", "Ctn Peak Tin 160g", shop).best?.how).toBe("learned");
   });
 
   it("treats sizes as exact, so 400g never matches 900g", () => {

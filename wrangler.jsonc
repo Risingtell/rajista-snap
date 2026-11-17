@@ -3,6 +3,8 @@
 {
   "name": "rajista-snap",
   "compatibility_date": "2026-11-01",
-  "assets": { "directory": "./dist", "not_found_handling": "single-page-application" },
+  // Snap is one page with no routes, so a missing file is a plain 404. (Answering a missing /assets/ bundle with the
+  // page, as a single-page-app fallback does, would get HTML cached for a year under the bundle's name.)
+  "assets": { "directory": "./dist", "not_found_handling": "none" },
   "routes": [{ "pattern": "snap.rajista.com", "custom_domain": true }]
 }
