@@ -78,7 +78,8 @@ const IMAGE_INPUT = { expectedInputs: [{ type: "image" }] };
 
 /** Set when an on-device reading ran past its time limit (or the device stayed busy twice): the rest of this visit reads in the cloud. */
 let slow = false;
-let busyTimes = 0;
+let busyInARow = 0;
+let slowBecause: "time" | "busy" = "time";
 export const deviceSlow = () => slow;
 
 export async function deviceStatus(): Promise<DeviceStatus> {
@@ -277,7 +278,10 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
   if (opts.forceCloud) {
     whyCloud = "You asked for a cloud read.";
   } else if (status === "available" && slow) {
-    whyCloud = "The on-device model was too slow on this computer earlier, so Snap reads in the cloud for the rest of this visit.";
+    whyCloud =
+      slowBecause === "busy"
+        ? "The on-device model stayed busy earlier, so Snap reads in the cloud for the rest of this visit."
+        : "The on-device model was too slow on this computer earlier, so Snap reads in the cloud for the rest of this visit.";
   } else if (status === "available") {
     onStep("device");
     let t = performance.now();
@@ -287,6 +291,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
         t = performance.now(); // the time the device spent reading, not waiting for it
         return timed((limit) => promptOnDevice(READ_SESSION, INVOICE_JSON_SCHEMA, [READ_PROMPT, photoPart(photo)], queue, limit), DEVICE_TIMEOUT_MS);
       }, "read");
+      busyInARow = 0;
       const invoice = normalize(r.response.text());
       const check = checkSums(invoice);
       device = { ms: Math.round(performance.now() - t), invoice, check };
@@ -299,13 +304,22 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
             ? "The on-device read listed charges (VAT, delivery or a discount), so the cloud checked them."
             : "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it.";
     } catch (e) {
-      if (/no answer after/.test(message(e))) slow = true;
-      if (/device busy/.test(message(e)) && ++busyTimes >= 2) slow = true; // Chrome is not letting go: stop waiting on it
+      const busy = /device busy/.test(message(e));
+      if (/no answer after/.test(message(e))) {
+        slow = true;
+        slowBecause = "time";
+      }
+      // Busy twice in a row: Chrome is not letting go of a cancelled prompt, so stop waiting on it this visit.
+      if (busy && ++busyInARow >= 2) {
+        slow = true;
+        slowBecause = "busy";
+      }
+      if (!busy) busyInARow = 0;
       device = { ms: Math.round(performance.now() - t), error: message(e) };
-      whyCloud = slow
-        ? "The on-device model took too long, so the cloud read it."
-        : /device busy/.test(message(e))
-          ? "The on-device model was still busy, so the cloud read it."
+      whyCloud = busy
+        ? "The on-device model was still busy, so the cloud read it."
+        : slow
+          ? "The on-device model took too long, so the cloud read it."
           : "The on-device model could not read this photo.";
     }
   } else {

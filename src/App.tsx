@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
-import { checkSums, linesTotal, naira, type Dispute, type Invoice, type Line } from "./invoice";
+import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
 import { devicePicksOff, pickOnDevice } from "./devicematch";
 import { aliasKey, isAliasOf, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
@@ -595,10 +595,10 @@ function DisputesNote({ disputes, invoice }: { disputes: Dispute[]; invoice: Inv
       {twoReads && " Two cloud reads disagreed."}
       {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
       {charges &&
-        (charges.other === null
-          ? " Snap could not look for VAT, delivery or a discount on their own, so check the paper for any that is not listed here."
+        (charges.note
+          ? ` ${charges.note}`
           : chargeRows
-            ? ` ${unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ")} ${unsure.length === 1 ? "was" : "were"} found by only one read (marked in orange). With ${unsure.length === 1 ? "it" : "them"}, the invoice adds up${invoice.total !== null ? `; without, the lines and other charges come to ${naira(linesTotal(invoice) + (invoice.charges ?? []).filter((c) => !c.unsure).reduce((t, c) => t + c.amount, 0))} and the total says ${naira(invoice.total)}` : ""}.`
+            ? ` ${unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ")} could not be confirmed, so ${unsure.length === 1 ? "it is" : "they are"} marked in orange.`
             : ` The charges (VAT, delivery or a discount) came to ${naira(charges.shown, "₦0")} in one read and ${naira(charges.other, "₦0")} in another.`)}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>

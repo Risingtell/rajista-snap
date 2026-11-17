@@ -45,8 +45,14 @@ export async function pickOnDevice(supplier: string | null, line: string, candid
       }
       return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;
     } catch (e) {
-      if (/no answer after/.test(String((e as Error)?.message ?? e))) picksOff = true;
-      throw e;
+      const m = String((e as Error)?.message ?? e);
+      // Too slow, or (never expected) an answer that did not come from the device: no more picks this visit.
+      if (/no answer after|did not come from the on-device model/.test(m)) {
+        picksOff = true;
+        throw e;
+      }
+      if (queue.aborted || (e as Error)?.name === "AbortError") throw e; // a reading needs the device: stop for now
+      return null; // this line's prompt failed: no pick for it, and the next line is tried
     }
   });
 }

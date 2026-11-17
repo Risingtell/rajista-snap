@@ -59,18 +59,19 @@ export const READ_PROMPT =
   "List every product line: quantity, the product description copied exactly as written (join a description that runs over " +
   "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
-  "List in charges any other amount that is written on the paper with its own figure and makes up the total, such as VAT, " +
-  "delivery, transport or a discount (a discount as a negative number). A subtotal, the total, an amount paid, a " +
-  "deposit or a balance is never a charge. Never invent a charge to make the numbers add up; leave charges empty if " +
-  "none is written. " +
-  "Also give the document total in naira (null if none), and the supplier: the business name printed at the top " +
+  "List in charges every other amount written on the paper with its own figure, apart from the grand total: VAT, " +
+  "delivery, transport, a deposit, a discount, a subtotal, an amount paid or a balance, each with its label as written " +
+  "(a discount or anything taken off as a negative number). Never invent an amount; leave charges empty if none is " +
+  "written. " +
+  "Also give the grand total in naira (null if none): the total for the goods and any charges, before any amount " +
+  "already paid is taken off. And give the supplier: the business name printed at the top " +
   "of the paper (null if none). Numbers only, no commas or currency signs. Copy every number exactly as written, even " +
   "if the arithmetic on the paper is wrong: never correct or recalculate it.";
 
 /**
- * A narrow look at the charges alone (VAT, delivery, transport, discounts). Charges are the one kind of number a
- * reader can make up to close a gap, so whenever a full read lists any, this read decides them (see src/flow.ts).
- * It is not asked to add anything up, so it has no gap to close.
+ * A narrow look at the extra amounts alone (VAT, delivery, deposits, discounts, subtotals, payments). It is the witness
+ * for them (see src/flow.ts): it is not asked to add anything up, so it has no gap to close, while a full read sees the
+ * gap and could make up a "discount" to close it.
  */
 export const CHARGES_JSON_SCHEMA = {
   type: "object",
@@ -78,16 +79,16 @@ export const CHARGES_JSON_SCHEMA = {
   required: ["charges"],
 } as const;
 export const CHARGES_PROMPT =
-  "Look only for amounts written on this invoice that are not product lines but are part of the amount to pay, such as " +
-  "VAT, delivery, transport or a discount (a discount as a negative number). A subtotal, the total, an amount paid, a " +
-  "deposit or a balance is never one of these: leave them out. Copy each label and figure exactly as written. Do not " +
-  "add anything up or work anything out. If no such amount is written, return an empty list. The photo may be " +
-  "sideways. Numbers only, no commas or currency signs.";
+  "Look only for amounts written on this invoice other than the product lines and the grand total: VAT, delivery, " +
+  "transport, a deposit, a discount, a subtotal, an amount paid or a balance. Copy each label and figure exactly as " +
+  "written (a discount or anything taken off as a negative number). Do not add anything up or work anything out. If " +
+  "no such amount is written, return an empty list. The photo may be sideways. Numbers only, no commas or currency signs.";
 
 /** A narrow second look at one number: the total as written. Used to settle two reads that disagree on it. */
 export const TOTAL_JSON_SCHEMA = { type: "object", properties: { total: { type: ["number", "null"] } }, required: ["total"] } as const;
 export const TOTAL_PROMPT =
-  "Look only at the grand total written on this invoice: the final amount to pay. Copy it exactly as written, digit by " +
+  "Look only at the grand total written on this invoice: the total for the goods and any charges, before any amount " +
+  "already paid or deposited is taken off. Copy it exactly as written, digit by " +
   "digit, even if it does not match the lines above it. The photo may be sideways. Number only, no commas or currency " +
   "signs; null if there is no total.";
 
@@ -133,29 +134,54 @@ export function chargesFrom(raw: unknown): Charge[] {
 export const linesTotal = (inv: Pick<Invoice, "items">) =>
   inv.items.reduce((s, l) => s + (l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : 0)), 0);
 
-const MAX_ROWS = 10;
+/** At most this many extra rows are tried; beyond it the paper is never blamed (see src/flow.ts). */
+export const MAX_ROWS = 12;
+const TAKEN_OFF = /discount|rebate|\bless\b|paid|payment|deposit|advance|credit|refund/i;
+
 /**
- * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. When several
- * choices work, the one with the most rows that read like charges, and the fewest that read like sums or payments,
- * wins; then the one with fewer rows.
+ * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. Each row is counted
+ * as read, left out, or, for a discount or payment written without a minus sign, taken off (returned with its amount
+ * negated). When several choices work, the one with the most rows that read like charges, and the fewest that read
+ * like sums or payments, wins; then the one that changes fewer signs; then the one with fewer rows.
  */
 export function addingSubset(lines: number, total: number, rows: Charge[]): Charge[] | null {
-  const k = Math.min(rows.length, MAX_ROWS);
-  let best: { set: Charge[]; score: number } | null = null;
-  for (let mask = 0; mask < 1 << k; mask++) {
-    const set = rows.slice(0, k).filter((_, i) => (mask >> i) & 1);
-    if (Math.abs(lines + set.reduce((t, r) => t + r.amount, 0) - total) > 1) continue;
-    const score = set.reduce((t, r) => t + (looksLikeCharge(r.label) ? 100 : -200), 0) - set.length;
-    if (!best || score > best.score) best = { set, score };
-  }
-  return best ? best.set : null;
+  const list = rows.slice(0, MAX_ROWS);
+  const found: { best: { set: Charge[]; score: number } | null } = { best: null };
+  const set: Charge[] = [];
+  const walk = (i: number, sum: number, score: number) => {
+    if (i === list.length) {
+      const s = score - set.length;
+      if (Math.abs(lines + sum - total) <= 1 && (!found.best || s > found.best.score)) found.best = { set: [...set], score: s };
+      return;
+    }
+    walk(i + 1, sum, score); // left out
+    const r = list[i];
+    // A charge-like row counts for; a "total" label (a summary of others) slightly less; a sum or payment against.
+    const weight = looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200;
+    set.push(r);
+    walk(i + 1, sum + r.amount, score + weight);
+    set.pop();
+    if (r.amount > 0 && TAKEN_OFF.test(r.label)) {
+      set.push({ ...r, amount: -r.amount });
+      walk(i + 1, sum - r.amount, score + weight - 10);
+      set.pop();
+    }
+  };
+  walk(0, 0, 0);
+  return found.best ? found.best.set : null;
 }
+
+/** Whether every line has a price (a total or a unit price): only then can the invoice total be checked. */
+export const allPriced = (inv: Pick<Invoice, "items">) => inv.items.every((l) => l.line_total !== null || l.unit_price !== null);
+
+/** The same row, whichever way its sign was taken. */
+export const sameRow = (a: Charge, b: Charge) => a.label === b.label && Math.abs(Math.abs(a.amount) - Math.abs(b.amount)) <= 1;
 
 /** One read's extra rows, split into those its total includes and the rest, as far as one read can tell. */
 export function arrange(inv: Invoice, rows: Charge[]): Invoice {
-  const set = inv.total !== null && inv.items.length ? addingSubset(linesTotal(inv), inv.total, rows) : null;
+  const set = inv.total !== null && inv.items.length && allPriced(inv) ? addingSubset(linesTotal(inv), inv.total, rows) : null;
   const counted = set ?? rows.filter((r) => looksLikeCharge(r.label));
-  return { ...inv, charges: counted, notCounted: rows.filter((r) => !counted.includes(r)) };
+  return { ...inv, charges: counted, notCounted: rows.filter((r) => !counted.some((c) => sameRow(c, r))) };
 }
 
 /** Turns whatever a model returned into a clean Invoice, or throws if it is not one. */
@@ -198,7 +224,8 @@ export type Check = {
 };
 
 /** Naira as shop owners write it: ₦109,500. A missing amount shows as `none` (empty by default). */
-export const naira = (n: number | null, none = "") => (n === null ? none : `₦${n.toLocaleString("en-NG")}`);
+export const naira = (n: number | null, none = "") =>
+  n === null ? none : `${n < 0 ? "-" : ""}₦${Math.abs(n).toLocaleString("en-NG")}`;
 
 /** The sum of the non-product charges (VAT, delivery, discounts). */
 export const chargesTotal = (inv: Invoice) => (inv.charges ?? []).reduce((s, c) => s + c.amount, 0);
@@ -285,6 +312,8 @@ export type Dispute = {
   field: "quantity" | "unit_price" | "line_total" | "total" | "charges" | "lines";
   shown: number | null;
   other: number | null;
+  /** For a charges dispute: what happened, in one or two plain sentences, for the screen. */
+  note?: string;
 };
 
 /** Every number on which the read being shown differs from the other read. */

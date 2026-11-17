@@ -34,9 +34,26 @@ function readers(script: { again?: Invoice | Error; strong?: Invoice | Error; to
 const busy = () => "it was busy";
 
 describe("resolve", () => {
-  it("counts a row two reads found, and one only the charges read found if it makes the sum work", () => {
-    expect(resolve(vatInvoice, [vatInvoice, vatInvoice], undefined).invoice.charges).toEqual([vat]);
+  it("counts a row the charges read found, and marks one that only full reads found", () => {
+    expect(resolve(vatInvoice, [vatInvoice, vatInvoice], [vat]).invoice.charges).toEqual([vat]);
     expect(resolve(vatMissed, [vatMissed, vatMissed], [vat]).invoice.charges).toEqual([vat]);
+    // Two full reads are the same model seeing the same gap: they do not confirm a row on their own.
+    const r = resolve(vatInvoice, [vatInvoice, vatInvoice], []);
+    expect(r.unsure).toEqual([vat]);
+    expect(r.invoice.charges).toEqual([{ ...vat, unsure: true }]);
+  });
+
+  it("never searches rows to fill a gap left by a line with no price", () => {
+    const unpriced = read({ supplier: null, items: [...goods, { quantity: 1, description: "Gift", unit_price: null, line_total: null }], total: 190000 });
+    const r = resolve(unpriced, [unpriced], [{ label: "Advance", amount: 30000 }]);
+    expect(r.unsure).toEqual([]);
+    expect(r.invoice.charges).toEqual([]);
+  });
+
+  it("never blames the paper when there are more rows than can all be tried", () => {
+    const many = Array.from({ length: 13 }, (_, i) => ({ label: `Row ${i + 1}`, amount: 1000 * (i + 1) }));
+    const r = resolve(paper, [paper, paper], many);
+    expect(r.capped).toBe(true);
   });
 
   it("marks a row only one full read found as unsure, and never makes it up", () => {
@@ -79,7 +96,46 @@ describe("settle", () => {
     const s = await settle(paperWithDiscount, r);
     expect(s.paperError).toBeUndefined();
     expect(s.invoice.charges).toEqual([{ ...discount, unsure: true }]);
-    expect(s.disputes).toEqual([{ line: null, field: "charges", shown: -500, other: 0 }]);
+    expect(s.disputes).toEqual([
+      {
+        line: null,
+        field: "charges",
+        shown: -500,
+        other: 0,
+        note: "Discount -₦500 was not found when the charges were read on their own, so it is marked in orange. With it, the total adds up; without, the lines and other charges come to ₦109,500 and the total says ₦109,000.",
+      },
+    ]);
+  });
+
+  it("does not let the same discount made up by both full reads hide the mistake when the charges read saw none", async () => {
+    const { r } = readers({ again: paperWithDiscount, charges: [] });
+    const s = await settle(paperWithDiscount, r);
+    expect(s.paperError).toBeUndefined();
+    expect(s.invoice.charges).toEqual([{ ...discount, unsure: true }]);
+    expect(s.disputes?.[0].note).toMatch(/^Discount -₦500 was not found when the charges were read on their own/);
+  });
+
+  it("still flags a line's arithmetic two reads confirmed, even when a charge is unsure", async () => {
+    const badLine = [line(2, "Ctn. Sugar 1kg", 30000, 60000), line(3, "Ctn. Indo", 5000, 18000), line(1, "Peak", 21000, 21000)]; // 3 × 5,000 is 15,000
+    const delivery = { label: "Delivery", amount: 1000 };
+    const withDelivery = read({ supplier: "Rising Technology", items: badLine, total: 100000 }, delivery);
+    const plain = read({ supplier: "Rising Technology", items: badLine, total: 100000 });
+    const s = await settle(withDelivery, readers({ again: plain, charges: [] }).r);
+    expect(s.paperError).toMatch(/^Line 2: 3 × ₦5,000 is ₦15,000, not ₦18,000\. Snap read the photo twice/);
+    expect(s.disputes?.[0].note).toMatch(/the total adds up/);
+  });
+
+  it("takes off a payment or discount written without a minus sign", async () => {
+    const paid = { label: "Paid", amount: 30000 };
+    const balanceDue = read({ supplier: "Tasiu", items: [line(1, "Generator", 100000, 100000)], total: 70000 }, paid);
+    const s1 = await settle(balanceDue, readers({ charges: [paid] }).r);
+    expect(s1.invoice.charges).toEqual([{ label: "Paid", amount: -30000 }]);
+    expect(s1.paperError).toBeUndefined();
+    const off = { label: "Discount", amount: 5000 };
+    const discounted = read({ supplier: "Tasiu", items: [line(1, "Generator", 100000, 100000)], total: 95000 }, off);
+    const s2 = await settle(discounted, readers({ charges: [off] }).r);
+    expect(s2.invoice.charges).toEqual([{ label: "Discount", amount: -5000 }]);
+    expect(s2.disputes).toBeUndefined();
   });
 
   it("marks a charge only the second read found, rather than believing it", async () => {
@@ -100,12 +156,12 @@ describe("settle", () => {
     expect(s.invoice.charges).toEqual([{ ...discount, unsure: true }]);
   });
 
-  it("believes a charge two full reads agree on, even if the charges read missed it", async () => {
+  it("marks, never blames, a VAT line both full reads found but the charges read missed", async () => {
     const { r, calls } = readers({ again: vatInvoice, charges: [] });
     const s = await settle(vatInvoice, r);
-    expect(s.invoice.charges).toEqual([vat]);
+    expect(s.invoice.charges).toEqual([{ ...vat, unsure: true }]);
     expect(s.paperError).toBeUndefined();
-    expect(s.disputes).toBeUndefined();
+    expect(s.disputes?.[0].note).toMatch(/^VAT 7\.5% ₦12,000 was not found when the charges were read on their own/);
     expect(calls).toEqual({ again: 1, strong: 0, total: 0, charges: 1 });
   });
 
@@ -158,15 +214,24 @@ describe("settle", () => {
     const { r } = readers({ again: paper, charges: new Error("busy") });
     const s = await settle(paper, r, { why: busy });
     expect(s.paperError).toBeUndefined();
-    expect(s.disputes).toEqual([{ line: null, field: "charges", shown: 0, other: null }]);
+    expect(s.disputes).toEqual([
+      {
+        line: null,
+        field: "charges",
+        shown: 0,
+        other: null,
+        note: "Snap could not check every VAT, delivery or discount line on its own, so check the paper for any that is not listed here.",
+      },
+    ]);
     expect(s.steps).toContain("Reading VAT, delivery and discounts on their own failed (it was busy).");
   });
 
-  it("still believes a charge two full reads agree on when the charges read fails", async () => {
+  it("marks a charge as not checked when the charges read fails", async () => {
     const { r } = readers({ again: vatInvoice, charges: new Error("busy") });
     const s = await settle(vatInvoice, r, { why: busy });
-    expect(s.invoice.charges).toEqual([vat]);
-    expect(s.disputes).toBeUndefined();
+    expect(s.invoice.charges).toEqual([{ ...vat, unsure: true }]);
+    expect(s.paperError).toBeUndefined();
+    expect(s.disputes?.[0].note).toMatch(/could not be checked \(reading the charges on their own failed\)/);
     expect(s.steps.join(" ")).toMatch(/reading them on their own failed \(it was busy\)/);
   });
 
@@ -197,6 +262,23 @@ describe("settle", () => {
     const s = await settle(paper, r);
     expect(calls.strong).toBe(1);
     expect(s.paperError).toMatch(/Snap read the photo twice/);
+  });
+
+  it("confirms the mistake when the stronger model agrees with either quick read", async () => {
+    const corrected = read({ ...paper, items: [line(2, "Sugar", 30000, 59500), ...lines.slice(1)] }); // "fixed" to add up
+    const { r } = readers({ again: corrected, strong: paper, charges: [] });
+    const s = await settle(paper, r);
+    expect(s.paperError).toMatch(/Snap read the photo twice/);
+    expect(s.invoice.items[0].line_total).toBe(60000);
+  });
+
+  it("keeps the supplier from either read when it shows one of two that differ", async () => {
+    const misread = read({ ...paper, supplier: null, items: [line(2, "Sugar", 30000, 61000), ...lines.slice(1)] });
+    const nameless = read({ ...paper, supplier: null });
+    const s = await settle(nameless, readers({ again: misread, strong: new Error("busy"), charges: [] }).r);
+    expect(s.invoice.supplier).toBeNull();
+    const s2 = await settle(paper, readers({ again: read({ ...misread }), strong: new Error("busy"), charges: [] }).r);
+    expect(s2.invoice.supplier).toBe("Rising Technology");
   });
 
   it("marks the disputed numbers when the stronger model cannot help", async () => {
