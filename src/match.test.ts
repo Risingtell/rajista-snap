@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aliasKey, isAlias, matchLine, similarity, words, type Product } from "./match";
+import { aliasKey, isAliasOf, matchLine, similarity, words, type Product } from "./match";
 
 const p = (id: string, name: string, aliases: string[] = []): Product => ({ id, name, sellPrice: null, lastCost: null, aliases });
 const shop = [
@@ -61,10 +61,13 @@ describe("matchLine", () => {
     expect(arabic).not.toBe(aliasKey("محلات", "Peak"));
   });
 
-  it("still recognises aliases saved in the older format", () => {
+  it("still recognises aliases saved by earlier versions", () => {
     const old = "rising technology|carton peak tin 160g"; // saved before 16 Nov 2026
-    expect(isAlias(old, aliasKey("RisingTechnology", "Ctn. Peak Tin 160g"))).toBe(true);
-    expect(isAlias(old, aliasKey("Other Supplier", "Ctn. Peak Tin 160g"))).toBe(false);
+    expect(isAliasOf(old, "RisingTechnology", "Ctn. Peak Tin 160g")).toBe(true);
+    expect(isAliasOf(old, "Other Supplier", "Ctn. Peak Tin 160g")).toBe(false);
+    const asciiOnly = "lstores|carton peak tin 160g"; // saved on 16 Nov 2026, when accented letters were dropped
+    expect(isAliasOf(asciiOnly, "Ọlá Stores", "Ctn Peak Tin 160g")).toBe(true);
+    expect(isAliasOf(asciiOnly, "Ola Stores", "Ctn Peak Tin 160g")).toBe(false);
     const shop = [p("peak", "Peak Milk Tin 160g", [old])];
     expect(matchLine("Rising Technology", "Ctn Peak Tin 160g", shop).best?.how).toBe("learned");
   });

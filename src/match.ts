@@ -59,13 +59,17 @@ const supplierKey = (supplier: string | null) =>
 export const aliasKey = (supplier: string | null, text: string) => `${supplierKey(supplier)}|${words(text).join(" ")}`;
 
 /**
- * Whether a saved alias is this key. Aliases saved before 16 Nov 2026 kept the supplier's spaces and punctuation
- * ("rising technology|..."), so the supplier part of a saved alias is normalised the same way before comparing.
+ * Whether a saved alias is how this supplier wrote this line. Aliases saved by earlier versions are still recognised:
+ * before 16 Nov 2026 the supplier part kept its spaces and punctuation ("rising technology|..."), and on 16 Nov it
+ * kept only the letters a to z and digits ("Ọlá Stores" was saved as "lstores|...").
  */
-export function isAlias(saved: string, key: string): boolean {
-  if (saved === key) return true;
+export function isAliasOf(saved: string, supplier: string | null, text: string): boolean {
+  const w = words(text).join(" ");
+  if (saved === `${supplierKey(supplier)}|${w}`) return true;
   const bar = saved.indexOf("|");
-  return bar >= 0 && supplierKey(saved.slice(0, bar)) + saved.slice(bar) === key;
+  if (bar < 0 || saved.slice(bar + 1) !== w) return false;
+  const was = saved.slice(0, bar);
+  return supplierKey(was) === supplierKey(supplier) || was === (supplier ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 export type Match = { product: Product; score: number; how: "learned" | "name" } | null;
@@ -76,8 +80,7 @@ export type Candidates = { best: Match; others: Product[] };
  * Also returns the next few candidates for the owner (or the on-device model) to choose from.
  */
 export function matchLine(supplier: string | null, text: string, products: Product[]): Candidates {
-  const key = aliasKey(supplier, text);
-  const learned = products.find((p) => p.aliases.some((a) => isAlias(a, key)));
+  const learned = products.find((p) => p.aliases.some((a) => isAliasOf(a, supplier, text)));
   const ranked = products.map((p) => ({ p, s: similarity(text, p.name) })).sort((a, b) => b.s - a.s);
   if (learned) return { best: { product: learned, score: 1, how: "learned" }, others: ranked.filter((r) => r.p !== learned).slice(0, 4).map((r) => r.p) };
   const top = ranked[0];

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHARGES_PROMPT, chargesFrom, checkSums, disputes, naira, normalize, reconcile, sameLines, sameNumbers, settleTotal, totalOnlyDispute, trustDeviceRead } from "./invoice";
+import { CHARGES_PROMPT, chargesFrom, checkSums, cleanCharges, disputes, isChargeLabel, naira, normalize, reconcile, sameLines, sameNumbers, settleTotal, totalOnlyDispute, trustDeviceRead } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -27,7 +27,7 @@ describe("checkSums", () => {
   it("allows half a naira per unit for a unit price rounded to the naira (a carton split per piece)", () => {
     const split = checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13000 }], total: 13000 }));
     expect(split.ok).toBe(true);
-    expect(split.notes).toEqual(["Line 1: 12 × ₦1,083 is ₦12,996, but the line says ₦13,000 (₦4 more). The unit price looks rounded from a pack price; check the line total against the paper."]);
+    expect(split.notes).toEqual(["Line 1: 12 × ₦1,083 is ₦12,996, but the line says ₦13,000 (₦4 more). A rounded unit price can explain that much; check the line total against the paper."]);
     expect(trustDeviceRead(split)).toBe(false);
     expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13100 }], total: 13100 })).ok).toBe(false);
   });
@@ -85,16 +85,24 @@ describe("checkSums", () => {
     expect(trustDeviceRead(c)).toBe(false);
   });
 
-  it("notes a gap only a rounded pack price explains, and fails any other gap", () => {
-    // ₦250.40 a piece is ₦1,252 for 5: a pack price, so this is a note for the owner.
-    const c = checkSums(normalize({ items: [{ quantity: 100, description: "Sachets", unit_price: 250, line_total: 25040 }], total: 25040 }));
+  it("notes any gap rounding can explain, never failing it, and fails a bigger gap", () => {
+    const sums = (quantity: number, unit: number, total: number) =>
+      checkSums(normalize({ items: [{ quantity, description: "Sachets", unit_price: unit, line_total: total }], total }));
+    // Within half a naira per piece, plus half a naira: a note to check, never "does not add up".
+    const c = sums(100, 250, 25040);
     expect(c.ok).toBe(true);
-    expect(c.notes).toEqual(["Line 1: 100 × ₦250 is ₦25,000, but the line says ₦25,040 (₦40 more). The unit price looks rounded from a pack price; check the line total against the paper."]);
-    // ₦250.499 a piece is no pack price: a ₦499 overcharge fails the check.
-    const big = checkSums(normalize({ items: [{ quantity: 1000, description: "Sachets", unit_price: 250, line_total: 250499 }], total: 250499 }));
+    expect(c.notes).toEqual(["Line 1: 100 × ₦250 is ₦25,000, but the line says ₦25,040 (₦40 more). A rounded unit price can explain that much; check the line total against the paper."]);
+    expect(sums(100, 333, 33333).notes).toHaveLength(1); // 3 for ₦1,000, with the line total rounded too
+    expect(sums(12, 1000, 12006).notes).toHaveLength(1);
+    expect(sums(1000, 250, 250499).notes).toEqual([
+      "Line 1: 1000 × ₦250 is ₦250,000, but the line says ₦250,499 (₦499 more). A rounded unit price can explain that much; check the line total against the paper.",
+    ]);
+    // Beyond what rounding can explain: the check fails.
+    const big = sums(1000, 250, 250600);
     expect(big.ok).toBe(false);
     expect(big.notes).toEqual([]);
-    expect(big.problems[0]).toBe("Line 1: 1000 × ₦250 is ₦250,000, not ₦250,499.");
+    expect(big.problems[0]).toBe("Line 1: 1000 × ₦250 is ₦250,000, not ₦250,600.");
+    expect(sums(12, 1000, 12007).ok).toBe(false);
   });
 
   it("rejects an empty read", () => {
@@ -262,6 +270,22 @@ describe("chargesFrom", () => {
     const copied = { charges: [{ label: "SUBTOTAL", amount: 160000 }, { label: "VAT 7.5%", amount: 12000 }, { label: "Grand Total", amount: 172000 }, { label: "Amount Paid", amount: 100000 }, { label: "Balance", amount: 72000 }, { label: "Total VAT", amount: 12000 }, { label: "Delivery", amount: 2000 }] };
     expect(chargesFrom(copied).map((c) => c.label)).toEqual(["VAT 7.5%", "Total VAT", "Delivery"]);
     expect(chargesFrom({})).toEqual([]);
+    // Payments and balances, wherever the word sits in the label; a cash discount is still a discount.
+    const payments = ["Less: Deposit", "Advance paid", "Previous balance", "Bal b/f", "Part payment", "Cash", "Change"];
+    for (const label of payments) expect(isChargeLabel(label)).toBe(false);
+    for (const label of ["VAT", "Total VAT", "Cash discount", "Delivery", "Transport", "Loading fee", "Total charges"]) expect(isChargeLabel(label)).toBe(true);
+  });
+
+  it("drops a sum or total copied as a charge, and a summary of the other charges, for every read", () => {
+    const items = [{ quantity: 4, description: "Ctn Milo 400g", unit_price: 40000, line_total: 160000 }];
+    const vat = { label: "VAT 7.5%", amount: 12000 };
+    expect(cleanCharges({ items, total: 172000 }, [{ label: "Amount excl. VAT", amount: 160000 }, vat, { label: "Total incl. VAT", amount: 172000 }])).toEqual([vat]);
+    const delivery = { label: "Delivery", amount: 5000 };
+    expect(cleanCharges({ items, total: 177000 }, [vat, delivery, { label: "Total charges", amount: 17000 }])).toEqual([vat, delivery]);
+    // A full read gets the same cleaning, so a copied total cannot make a correct invoice look wrong.
+    const read = normalize({ items, charges: [vat, { label: "Total incl. VAT", amount: 172000 }], total: 172000 });
+    expect(read.charges).toEqual([vat]);
+    expect(checkSums(read).ok).toBe(true);
   });
 
   it("asks for the charges only, without adding anything up", () => {

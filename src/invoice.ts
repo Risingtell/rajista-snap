@@ -91,11 +91,21 @@ const num = (v: unknown): number | null => {
   return null;
 };
 
-// Readers sometimes copy the subtotal, the total or the amount paid into the charges (seen on 16 Nov 2026 with a
+// Readers sometimes copy a subtotal, the total, a payment or a balance into the charges (seen on 16 Nov 2026 with a
 // printed VAT invoice: "SUBTOTAL 160,000" next to "VAT 7.5% 12,000"). Those are sums or payments, not charges.
-const NOT_A_CHARGE = /^\s*(sub[\s-]*total|grand[\s-]*total|net[\s-]*total|total|amount(\s+(paid|due|payable))?|balance|deposit|paid|cash|change)\b/i;
-const A_CHARGE = /vat|tax|levy|deliver|transport|freight|carriage|loading|discount|rebate|charge|fee/i;
-export const isChargeLabel = (label: string) => A_CHARGE.test(label) || !NOT_A_CHARGE.test(label);
+const PAYMENT = /\b(deposit|advance|balance|bal|b\/f|c\/f|brought\s+forward|carried\s+forward|paid|payments?|amount\s+(due|payable))\b/i;
+const MONEY_HANDED = /\b(cash|change)\b/i;
+const SUMMARY = /\b(sub[\s-]*total|grand[\s-]*total|net[\s-]*total|total)\b/gi;
+const A_CHARGE = /vat|tax|levy|deliver|transport|freight|carriage|loading|discount|rebate|commission|surcharge|fee|charge/i;
+
+/** Whether a row's label names a charge (VAT, delivery, a discount) rather than a sum, a payment or a balance. */
+export function isChargeLabel(label: string): boolean {
+  if (PAYMENT.test(label)) return false; // "Less: Deposit", "Advance paid", "Previous balance", "Bal b/f"
+  const rest = label.replace(SUMMARY, " ");
+  if (rest !== label && !A_CHARGE.test(rest)) return false; // "Subtotal", "Grand total"; but "Total VAT" is VAT
+  if (MONEY_HANDED.test(label) && !A_CHARGE.test(label)) return false; // "Cash", "Change"; but "Cash discount" is one
+  return true;
+}
 
 /** The charges in whatever a model returned: labelled, non-zero amounts that are not a subtotal, total or payment. */
 export function chargesFrom(raw: unknown): Charge[] {
@@ -109,8 +119,22 @@ export function chargesFrom(raw: unknown): Charge[] {
 }
 
 /** The sum of the line totals (a line with no total counts as quantity × unit price, if it has one). */
-export const linesTotal = (inv: Invoice) =>
+export const linesTotal = (inv: Pick<Invoice, "items">) =>
   inv.items.reduce((s, l) => s + (l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : 0)), 0);
+
+/**
+ * The charges that really are charges for this read. An amount equal to the lines' sum or to the total is that sum
+ * or total copied as a charge ("Amount excl. VAT", "Total incl. VAT"), and an amount under a "total" label equal to
+ * the other charges together is a summary of them ("Total charges"). Applied to every read, full or narrow.
+ */
+export function cleanCharges(inv: Pick<Invoice, "items" | "total">, charges: Charge[]): Charge[] {
+  const near = (a: number, b: number) => Math.abs(a - b) <= 1;
+  const sum = linesTotal(inv);
+  const kept = charges.filter((c) => !(sum > 0 && near(c.amount, sum)) && !(inv.total !== null && inv.total !== 0 && near(c.amount, inv.total)));
+  return kept.filter(
+    (c, i) => !(kept.length > 1 && /\btotal\b/i.test(c.label) && near(c.amount, kept.reduce((t, x, j) => (j === i ? t : t + x.amount), 0))),
+  );
+}
 
 /** Turns whatever a model returned into a clean Invoice, or throws if it is not one. */
 export function normalize(raw: unknown): Invoice {
@@ -127,9 +151,10 @@ export function normalize(raw: unknown): Invoice {
       };
     })
     .filter((l) => l.description);
-  const charges = chargesFrom(o);
+  const total = num(o.total);
+  const charges = cleanCharges({ items, total }, chargesFrom(o));
   const supplier = typeof o.supplier === "string" && o.supplier.trim() ? o.supplier.replace(/\s+/g, " ").trim() : null;
-  return { supplier, items, charges, total: num(o.total) };
+  return { supplier, items, charges, total };
 }
 
 export type Check = {
@@ -137,8 +162,8 @@ export type Check = {
   /** One plain sentence per problem, shown to the shop owner when a read goes to the cloud. */
   problems: string[];
   /**
-   * Line differences a rounded per-piece price explains (a pack price split over a few pieces): the numbers cannot
-   * tell that from a small overcharge, so the owner is shown a note to check. Not a failure, but never "all clear".
+   * Line differences that rounding can explain (half a naira per piece, plus half a naira): the numbers cannot tell
+   * that from a small overcharge, so the owner is shown a note to check. Not a failure, but never "all clear".
    */
   notes: string[];
   hasPrices: boolean;
@@ -159,21 +184,12 @@ export const chargesTotal = (inv: Invoice) => (inv.charges ?? []).reduce((s, c) 
 
 // Totals on these papers are whole naira: the lines (and charges) must match the invoice total to within ₦1, so a
 // real ₦2,000 adding error on a ₦2.4 million invoice is caught. A line's quantity × unit price must also match its
-// total to within ₦1, with one exception: a per-piece price rounded from a pack price (a carton of 12 for ₦13,000 is
-// ₦1,083.33 a piece, written ₦1,083). Then the exact price is a whole number of naira split over a few pieces, and
-// the written price is that rounded to the naira. Such a line becomes a note for the owner, not a failure; any other
-// gap (1,000 × ₦250 written as ₦250,499) fails the check.
+// total to within ₦1, except where rounding can explain the gap. A per-piece price is often rounded to the naira (a
+// carton of 12 for ₦13,000 is ₦1,083.33 a piece, written ₦1,083), and so may the line total be, so a gap of up to
+// half a naira per piece, plus half a naira, is shown to the owner as a note to check. It never fails the check (a
+// false "does not add up" would blame an honest supplier) and never reads as "all clear". A bigger gap fails.
 const closeTotal = (a: number, b: number) => Math.abs(a - b) <= 1;
-const MAX_PACK = 48;
-function roundedPackPrice(quantity: number, unit: number, lineTotal: number): boolean {
-  const exact = lineTotal / quantity;
-  if (Math.abs(exact - unit) > 0.5) return false;
-  for (let pieces = 2; pieces <= MAX_PACK; pieces++) {
-    const pack = exact * pieces;
-    if (Math.abs(pack - Math.round(pack)) < 1e-6 * Math.max(1, pack)) return true;
-  }
-  return false;
-}
+const roundingCovers = (quantity: number, gap: number) => Math.abs(gap) <= 0.5 * quantity + 0.5;
 
 /**
  * Does the invoice add up? Quantity x unit price must equal each line total, and the lines plus any charges must
@@ -192,9 +208,9 @@ export function checkSums(inv: Invoice): Check {
       const product = l.quantity * l.unit_price;
       const gap = l.line_total - product;
       if (Math.abs(gap) > 1) {
-        if (roundedPackPrice(l.quantity, l.unit_price, l.line_total)) {
+        if (roundingCovers(l.quantity, gap)) {
           notes.push(
-            `Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, but the line says ${naira(l.line_total)} (${naira(Math.abs(gap))} ${gap > 0 ? "more" : "less"}). The unit price looks rounded from a pack price; check the line total against the paper.`,
+            `Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, but the line says ${naira(l.line_total)} (${naira(Math.abs(gap))} ${gap > 0 ? "more" : "less"}). A rounded unit price can explain that much; check the line total against the paper.`,
           );
         } else {
           problems.push(`Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, not ${naira(l.line_total)}.`);
@@ -278,7 +294,7 @@ export type Reconciled = {
 };
 
 const PAPER_ADVICE =
-  " Check these numbers against the paper: if they match, the invoice itself does not add up, so check it with the supplier before you pay. (If the total includes VAT, delivery or a discount that is not listed above, it may not be a mistake.)";
+  " Check these numbers against the paper: if they match, the invoice itself does not add up, so check it with the supplier before you pay. (If the total includes VAT, delivery, a discount or an old balance that is not listed above, it may not be a mistake.)";
 
 /**
  * Combines a first read that did not add up with a second read of the same photo (charges already settled).

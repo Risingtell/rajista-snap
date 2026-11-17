@@ -46,6 +46,29 @@ describe("onDevice", () => {
     expect(deviceReadWaiting()).toBe(false);
   });
 
+  it("lets a reading wait briefly for Chrome to let go of a cancelled match, then gives up so the cloud reads it", async () => {
+    // A match whose prompt takes 120 ms to stop after it is cancelled.
+    const slowToStop = (signal: AbortSignal) =>
+      new Promise<string>((_, no) => signal.addEventListener("abort", () => setTimeout(() => no(new Error("stopped")), 120), { once: true }));
+    const pick = onDevice(slowToStop);
+    await later(5, 0);
+    let ran = false;
+    const read = onDevice(async () => ((ran = true), "read"), "read", 30);
+    await expect(pick).rejects.toThrow("A reading needs the on-device model.");
+    await expect(read).rejects.toThrow("device busy");
+    expect(ran).toBe(false);
+    // Once Chrome lets go, the device is used again.
+    await later(150, 0);
+    expect(await onDevice(async () => "read again", "read", 30)).toBe("read again");
+
+    // When Chrome lets go within the wait, the reading runs.
+    const pick2 = onDevice(slowToStop);
+    await later(5, 0);
+    const read2 = onDevice(async () => "read", "read", 1000);
+    await expect(pick2).rejects.toThrow();
+    expect(await read2).toBe("read");
+  });
+
   it("keeps going after a job fails", async () => {
     await expect(onDevice(async () => Promise.reject(new Error("no model")))).rejects.toThrow("no model");
     expect(await onDevice(async () => "next")).toBe("next");

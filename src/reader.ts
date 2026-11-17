@@ -103,9 +103,27 @@ export async function downloadDeviceModel(onProgress: (fraction: number) => void
   s.destroy();
 }
 
-// The last finished prompt's session stays open so Chrome keeps the model loaded for the next prompt; it is closed
-// when the next prompt finishes. A prompt that fails or is cancelled has its session closed at once.
-let keptSession: AbortController | null = null;
+// The last finished prompt's session stays open for a minute, so Chrome keeps the model loaded for the next prompt (a
+// product match follows a reading within seconds). It is closed when the next prompt finishes, or after that minute.
+// A prompt that fails or is cancelled has its session closed at once.
+const KEEP_MS = 60_000;
+let keptSession: { stop: AbortController; timer: ReturnType<typeof setTimeout> } | null = null;
+function keep(session: AbortController) {
+  if (keptSession) {
+    clearTimeout(keptSession.timer);
+    keptSession.stop.abort();
+  }
+  const mine = {
+    stop: session,
+    timer: setTimeout(() => {
+      if (keptSession === mine) {
+        keptSession = null;
+        session.abort();
+      }
+    }, KEEP_MS),
+  };
+  keptSession = mine;
+}
 
 /**
  * One prompt on Chrome's on-device model, in a fresh session. The Firebase SDK passes createOptions to
@@ -143,8 +161,7 @@ export async function promptOnDevice(
     });
     const r = await model.generateContent(parts);
     assertOnDevice(r);
-    keptSession?.abort();
-    keptSession = session;
+    keep(session);
     kept = true;
     return r;
   } finally {
@@ -283,7 +300,11 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
     } catch (e) {
       if (/no answer after/.test(message(e))) slow = true;
       device = { ms: Math.round(performance.now() - t), error: message(e) };
-      whyCloud = slow ? "The on-device model took too long, so the cloud read it." : "The on-device model could not read this photo.";
+      whyCloud = slow
+        ? "The on-device model took too long, so the cloud read it."
+        : /device busy/.test(message(e))
+          ? "The on-device model was still busy, so the cloud read it."
+          : "The on-device model could not read this photo.";
     }
   } else {
     whyCloud = status === "unsupported" ? "This browser has no on-device model." : "The on-device model is not ready on this computer.";

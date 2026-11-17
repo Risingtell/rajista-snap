@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
-import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
+import { checkSums, linesTotal, naira, type Dispute, type Invoice, type Line } from "./invoice";
 import { devicePicksOff, pickOnDevice } from "./devicematch";
-import { aliasKey, isAlias, matchLine, type Product } from "./match";
+import { aliasKey, isAliasOf, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
 import { cloudCost, loadSettings } from "./settings";
 import { deleteProduct, listProducts, newId, saveProducts } from "./store";
@@ -240,7 +240,7 @@ export function App() {
       if (cost !== null) p.lastCost = cost;
       if (prices[i] != null) p.sellPrice = prices[i]!;
       const key = aliasKey(invoice.supplier, l.description);
-      if (!p.aliases.some((a) => isAlias(a, key))) {
+      if (!p.aliases.some((a) => isAliasOf(a, invoice.supplier, l.description))) {
         p.aliases.push(key);
         learned++;
       }
@@ -336,7 +336,7 @@ export function App() {
                     <b>This invoice does not add up.</b> {reading.paperError}
                   </div>
                 ))}
-              {reading.disputes && <DisputesNote disputes={reading.disputes} />}
+              {reading.disputes && <DisputesNote disputes={reading.disputes} invoice={invoice} />}
               {reading.source === "device" && (
                 <button className="link" disabled={busy} onClick={cloudInstead}>
                   Names look wrong? Read it again in the cloud
@@ -582,7 +582,7 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
 }
 
 /** Explains disputed numbers without promising marks that are not on screen. */
-function DisputesNote({ disputes }: { disputes: Dispute[] }) {
+function DisputesNote({ disputes, invoice }: { disputes: Dispute[]; invoice: Invoice }) {
   const marked = disputes.filter((d) => d.field !== "lines" && d.field !== "charges").length;
   const lines = disputes.find((d) => d.field === "lines");
   const charges = disputes.find((d) => d.field === "charges");
@@ -596,7 +596,8 @@ function DisputesNote({ disputes }: { disputes: Dispute[] }) {
       {charges &&
         (charges.other === null
           ? ` The charges (VAT, delivery or a discount) could not be read again on their own to confirm them${chargeRows ? ", so they are marked in orange" : ""}.`
-          : ` Their charges (VAT, delivery, discounts) came to ${naira(charges.shown, "₦0")} and ${naira(charges.other, "₦0")}${chargeRows ? ", marked in orange" : ""}.`)}
+          : ` The charges (VAT, delivery or a discount) came to ${naira(charges.shown, "₦0")} in one read and ${naira(charges.other, "₦0")} in another${chargeRows ? "; they are marked in orange" : ""}.`)}
+      {charges && chargeRows && invoice.total !== null && ` Without them, the lines come to ${naira(linesTotal(invoice))} and the total says ${naira(invoice.total)}.`}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>
   );
