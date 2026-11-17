@@ -44,13 +44,30 @@ describe("resolve", () => {
     expect(resolve(vatInvoice, [vatInvoice, vatInvoice], [vat])).toMatchObject({ verdict: "adds", unsure: [] });
     const r = resolve(vatInvoice, [vatInvoice, vatInvoice], []);
     expect(r.verdict).toBe("adds-if");
-    expect(r.unsure).toEqual([{ row: vat, why: "unconfirmed" }]);
+    expect(r.unsure).toEqual([{ row: vat, why: "unconfirmed", found: 2 }]);
     expect(r.invoice.charges).toEqual([{ ...vat, unsure: true }]);
   });
 
-  it("ignores rows that only repeat the total or the lines' sum", () => {
-    const echoes = read({ ...paper }, { label: "Total", amount: 109000 }, { label: "Sub-total", amount: 109500 });
+  it("ignores rows that only repeat the total, but never a subtotal equal to the lines", () => {
+    const echoes = read({ ...paper }, { label: "Total", amount: 109000 }, { label: "Amount paid", amount: 109000 });
     expect(resolve(echoes, [echoes, echoes], [{ label: "TOTAL", amount: 109000 }]).verdict).toBe("clean-mismatch");
+    // Paid in two parts that make the total.
+    const paidInTwo = read({ ...paper }, { label: "Deposit", amount: 50000 }, { label: "Balance", amount: 59000 });
+    expect(resolve(paidInTwo, [paidInTwo, paidInTwo], [{ label: "Deposit", amount: 50000 }, { label: "Balance", amount: 59000 }]).verdict).toBe("clean-mismatch");
+    // A subtotal equal to the lines shows the total adds something to them, so the paper is not "clean".
+    const sub = read({ ...paper }, { label: "Sub-total", amount: 109500 });
+    expect(resolve(sub, [sub, sub], [{ label: "Sub-total", amount: 109500 }])).toMatchObject({ verdict: "no-way", subtotal: { label: "Sub-total", amount: 109500 } });
+  });
+
+  it("leaves the total unchecked when a line has a unit price but no quantity and no line total", () => {
+    const rice = normalize({
+      items: [
+        { quantity: null, description: "Rice", unit_price: 25000, line_total: null },
+        { quantity: 3, description: "Salt", unit_price: 1000, line_total: 3000 },
+      ],
+      total: 53000,
+    });
+    expect(resolve(rice, [rice, rice], []).verdict).toBe("unchecked");
   });
 
   it("does not check a total when a line has no price", () => {
@@ -84,6 +101,14 @@ describe("settle: when the supplier is blamed", () => {
     expect(s.disputes).toBeUndefined();
     expect(calls).toEqual({ again: 1, strong: 0, total: 0, charges: 1 });
     expect(s.steps).toContain("VAT, delivery and discounts were also read on their own.");
+  });
+
+  it("blames a clean receipt whose only other row repeats the total (paid in full)", async () => {
+    const paid = { label: "Amount paid", amount: 110000 };
+    const receipt = read({ supplier: "Tasiu", items: [line(2, "Rice", 54500, 109000)], total: 110000 }, paid);
+    const s = await settle(receipt, readers({ again: receipt, charges: [paid] }).r);
+    expect(s.paperError).toMatch(/^The lines add up to ₦109,000, but the invoice total says ₦110,000\. Snap read the photo twice/);
+    expect(s.disputes).toBeUndefined();
   });
 
   it("flags a line's own arithmetic found twice, even when a charge is unconfirmed", async () => {
@@ -126,23 +151,34 @@ describe("settle: never blamed, never cleared on a guess", () => {
     expect(s.steps).toContain("Reading VAT, delivery and discounts on their own failed (it was busy).");
   });
 
-  it("marks a discount the charges read did not find: not all clear, not blamed", async () => {
-    const { r, calls } = readers({ charges: [] });
+  it("marks a discount the charges read did not find, after reading again: not all clear, not blamed", async () => {
+    const { r, calls } = readers({ again: paper, charges: [] });
     const s = await settle(paperWithDiscount, r);
     expect(s.paperError).toBeUndefined();
     expect(s.invoice.charges).toEqual([{ ...discount, unsure: true }]);
     expect(s.disputes?.[0].note).toBe(
-      "Discount -₦500 is counted, but the charges read on their own did not find it. With it the total adds up; without, the lines and other charges come to ₦109,500 and the total says ₦109,000. It is marked in orange: check against the paper.",
+      "Discount -₦500 is counted, but the charges read on their own did not find it, and only 1 of 2 full reads did. With it the total adds up; without, the lines and other charges come to ₦109,500 and the total says ₦109,000. It is marked in orange: check against the paper.",
     );
-    expect(calls).toEqual({ again: 0, strong: 0, total: 0, charges: 1 });
+    expect(calls).toEqual({ again: 1, strong: 0, total: 0, charges: 1 });
+    expect(s.steps).toContain("It adds up only with Discount -₦500, which the charges read on their own did not find, so it was read a second time.");
   });
 
-  it("marks a VAT line the charges read missed, without a second full read (it could not confirm it)", async () => {
-    const { r, calls } = readers({ charges: [] });
+  it("marks a VAT line the charges read missed, even when both full reads found it", async () => {
+    const { r, calls } = readers({ again: vatInvoice, charges: [] });
     const s = await settle(vatInvoice, r);
     expect(s.paperError).toBeUndefined();
     expect(s.invoice.charges).toEqual([{ ...vat, unsure: true }]);
-    expect(calls).toEqual({ again: 0, strong: 0, total: 0, charges: 1 });
+    expect(s.disputes?.[0].note).toMatch(/^VAT 7\.5% ₦12,000 is counted, but the charges read on their own did not find it\. With it/);
+    expect(calls).toEqual({ again: 1, strong: 0, total: 0, charges: 1 });
+  });
+
+  it("shows the right lines when a made-up row was covering a misread line", async () => {
+    const right = read({ supplier: "Tasiu", items: [line(2, "Rice", 54500, 109000)], total: 109000 });
+    const misread = read({ supplier: "Tasiu", items: [line(2, "Rice", 54000, 108000)], total: 109000 }, { label: "Delivery", amount: 1000 });
+    const s = await settle(misread, readers({ again: right, strong: right, charges: [] }).r);
+    expect(s.invoice.items[0].line_total).toBe(109000);
+    expect(s.disputes).toBeUndefined();
+    expect(s.paperError).toBeUndefined();
   });
 
   it("marks charges as unchecked when the charges read fails", async () => {
@@ -155,13 +191,39 @@ describe("settle: never blamed, never cleared on a guess", () => {
     const s = await settle(generator(103000, plus), readers({ charges: [{ label: "Discount", amount: -3000 }] }).r);
     expect(s.paperError).toBeUndefined();
     expect(s.invoice.charges).toEqual([{ ...plus, unsure: true }]);
-    expect(s.disputes?.[0].note).toMatch(/^Discount ₦3,000 is counted the other way from what the label says/);
+    expect(s.disputes?.[0].note).toMatch(/^Discount ₦3,000 is added, but its label reads like something taken off/);
   });
 
-  it("never lets a delivery line vouch for a discount of the same size", async () => {
+  it("marks, never clears, a payment or credit added to the total, or a tax taken off it", async () => {
+    const paid = { label: "Amount paid", amount: 5000 };
+    const a = await settle(generator(105000, paid), readers({ charges: [paid] }).r);
+    expect(a.invoice.charges).toEqual([{ ...paid, unsure: true }]);
+    expect(a.disputes?.[0].note).toMatch(/^Amount paid ₦5,000 is added, but its label reads like something taken off \(a discount or a payment\)\. With it the total adds up/);
+    const credit = { label: "Credit", amount: 5000 };
+    expect((await settle(generator(105000, credit), readers({ charges: [credit] }).r)).invoice.charges).toEqual([{ ...credit, unsure: true }]);
+    const tax = { label: "Tax", amount: 7500 };
+    expect((await settle(generator(92500, tax), readers({ charges: [tax] }).r)).disputes?.[0].note).toMatch(/^Tax -₦7,500 is taken off, but/);
+    // VAT written without a space, as handwriting often is.
+    const vat7 = { label: "VAT7.5%", amount: 7500 };
+    expect((await settle(generator(92500, vat7), readers({ charges: [vat7] }).r)).invoice.charges).toEqual([{ ...vat7, amount: -7500, unsure: true }]);
+  });
+
+  it("never lets a delivery line or a payment vouch for a discount of the same size", async () => {
     const s = await settle(generator(97000, { label: "Discount", amount: -3000 }), readers({ charges: [{ label: "Delivery", amount: 3000 }] }).r);
     expect(s.paperError).toBeUndefined();
     expect(s.invoice.charges?.some((c) => c.unsure)).toBe(true);
+    const t = await settle(generator(95000, { label: "Discount", amount: -5000 }), readers({ charges: [{ label: "Paid", amount: 5000 }] }).r);
+    expect(t.invoice.charges).toEqual([{ label: "Discount", amount: -5000, unsure: true }]);
+  });
+
+  it("never blames a total that adds something to a subtotal equal to the lines", async () => {
+    const sub = { label: "Subtotal", amount: 100000 };
+    const inv = generator(107500, sub); // the VAT line between them was missed by every read
+    const s = await settle(inv, readers({ again: inv, charges: [sub] }).r);
+    expect(s.paperError).toBeUndefined();
+    expect(s.disputes?.[0].note).toBe(
+      "The paper shows Subtotal ₦100,000, the same as the lines, but the total says ₦107,500. The ₦7,500 between them may be VAT, delivery, a discount or another amount Snap could not read: check the paper. If nothing else is written there, the total is wrong.",
+    );
   });
 
   it("asks the owner to check the total, never blaming, when other amounts are listed and no way of counting them works", async () => {
@@ -177,6 +239,20 @@ describe("settle: never blamed, never cleared on a guess", () => {
     expect(normalize(noQty).items[0]).toMatchObject({ quantity: 1, guessed: true });
     const s = await settle(normalize(noQty), readers({ again: normalize(noQty), charges: [] }).r);
     expect(s.paperError).toBeUndefined();
+    // "Rice @ 25,000" with no quantity and no line total: Snap's guess of one bag is never summed against the total.
+    const rice = normalize({
+      supplier: "Tasiu",
+      items: [
+        { quantity: null, description: "Rice", unit_price: 25000, line_total: null },
+        { quantity: 3, description: "Salt", unit_price: 1000, line_total: 3000 },
+      ],
+      total: 53000,
+    });
+    const { r, calls } = readers({ again: rice, charges: [] });
+    const t = await settle(rice, r);
+    expect(t.paperError).toBeUndefined();
+    expect(t.disputes).toBeUndefined();
+    expect(calls.again).toBe(0);
   });
 
   it("never blames the paper when there are more rows than can all be tried", async () => {
@@ -228,7 +304,7 @@ describe("settle: all clear", () => {
     const fee = { label: "Late payment fee", amount: 2000 };
     const b = await settle(generator(102000, fee), readers({ charges: [fee] }).r);
     expect(b.disputes).toBeUndefined();
-    const blank = { label: "Charge", amount: -500 };
+    const blank = { label: "Other amount", amount: -500 };
     const c = await settle(generator(99500, blank), readers({ charges: [blank] }).r);
     expect(c.disputes).toBeUndefined();
   });

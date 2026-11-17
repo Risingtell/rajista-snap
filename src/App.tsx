@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rajistaCsv, rows, whatsappText } from "./export";
 import { preparePhoto, type Photo } from "./image";
-import { checkSums, naira, type Dispute, type Invoice, type Line } from "./invoice";
+import { checkSums, naira, type Check, type Dispute, type Invoice, type Line } from "./invoice";
 import { devicePicksOff, pickOnDevice, PickSkipped } from "./devicematch";
 import { aliasKey, isAliasOf, matchLine, type Product } from "./match";
 import { CLOUD_MODEL, deviceReadWaiting, deviceSlow, deviceStatus, downloadDeviceModel, readInvoice, type DeviceStatus, type Reading } from "./reader";
@@ -431,23 +431,7 @@ export function App() {
                 </tfoot>
               </table>
               <p className={check.ok && check.crossChecked && !reading.disputes && !check.notes.length ? "sums ok" : "sums bad"}>
-                {!check.ok
-                  ? check.problems.join(" ")
-                  : !check.hasPrices
-                    ? "No prices on this paper."
-                    : !check.crossChecked
-                      ? invoice.total === null
-                        ? "No total on this paper to check the prices against."
-                        : "Some lines have no price, so the total could not be checked."
-                      : reading.disputes
-                      ? reading.disputes.some((d) => d.field !== "lines" && d.field !== "charges")
-                        ? "Adds up as shown, but check the numbers marked in orange against the paper."
-                        : reading.disputes.some((d) => d.field === "lines")
-                          ? "Adds up as shown, but the two reads disagreed: check every line against the paper."
-                          : "Adds up as shown, but check the charges (VAT, delivery or a discount) against the paper."
-                      : check.notes.length
-                        ? "Adds up, but check the note below."
-                        : "✓ Everything adds up."}
+                {sumsLine(check, invoice, reading.disputes)}
               </p>
               {check.notes.length > 0 && <p className="notes">{check.notes.join(" ")}</p>}
               <div className="actions">
@@ -595,6 +579,33 @@ function ProductList({ products, onChange }: { products: Product[]; onChange: ()
       </table>
     </details>
   );
+}
+
+/** The one line under the table that says whether the invoice adds up, and what to check if it may not. */
+function sumsLine(check: Check, invoice: Invoice, disputes?: Dispute[]): string {
+  const marked = disputes?.some((d) => d.field !== "lines" && d.field !== "charges");
+  const lines = disputes?.some((d) => d.field === "lines");
+  if (!check.ok) return check.problems.join(" ");
+  if (!check.hasPrices) return "No prices on this paper.";
+  if (!check.crossChecked) {
+    const noQuantity = invoice.items.filter((l) => l.guessed && l.line_total === null && l.unit_price !== null).length;
+    const why =
+      invoice.total === null
+        ? "No total on this paper to check the prices against."
+        : invoice.items.some((l) => l.line_total === null && l.unit_price === null)
+          ? "Some lines have no price, so the total could not be checked."
+          : `${noQuantity === 1 ? "A line has" : "Some lines have"} no quantity written, so the total could not be checked: type the quantity in.`;
+    // The two reads may also have disagreed: the owner is told to check those numbers too.
+    return lines ? `${why} The two reads also disagreed: check every line against the paper.` : marked ? `${why} Check the numbers marked in orange against the paper.` : why;
+  }
+  if (disputes) {
+    return marked
+      ? "Adds up as shown, but check the numbers marked in orange against the paper."
+      : lines
+        ? "Adds up as shown, but the two reads disagreed: check every line against the paper."
+        : "Adds up as shown, but check the charges (VAT, delivery or a discount) against the paper.";
+  }
+  return check.notes.length ? "Adds up, but check the note below." : "✓ Everything adds up.";
 }
 
 /** Explains disputed numbers without promising marks that are not on screen. */

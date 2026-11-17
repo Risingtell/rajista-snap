@@ -3,34 +3,39 @@
 // What Snap says, and when:
 //
 // - "This invoice does not add up" (the supplier's mistake) only when the lines and total were found twice and either
-//   a line's own arithmetic is wrong (with its quantity written), or the paper holds nothing but lines and a total (no
-//   VAT, delivery, discount, deposit or payment; the charges read on their own confirms it) and they do not match.
-//   Sample invoice 1 is this case, as are most handwritten receipts.
-// - When other amounts are on the paper, Snap tries every way of counting them (as written, with the sign turned, or
+//   a line's own arithmetic is wrong (with its quantity written), or no read found anything on the paper but the lines
+//   and a total (both full reads and the charges read on their own, which must have worked; a row that only repeats
+//   the total, such as "Amount paid" equal to it, does not count), every line's amount is written, and they do not
+//   match. Sample invoice 1 is this case, as are most handwritten receipts.
+// - When any read found other amounts, Snap tries every way of counting them (as written, with the sign turned, or
 //   left out). "Everything adds up" only if a way works using rows the charges read also found, none of them counted
-//   the other way from what its label says. Otherwise the rows are marked in orange for the owner to check, or, when
-//   no way works, the owner is asked to check the total. The supplier is never blamed then: which rows a total
-//   includes cannot be told for sure from labels, so a guess is never turned into an accusation.
+//   against its label (a discount or a payment added, VAT or delivery taken off, a subtotal counted). Otherwise the
+//   rows are marked in orange for the owner to check, or, when no way works, the owner is asked to check the total.
+//   The supplier is never blamed then: which rows a total includes cannot be told for sure, so a guess is never
+//   turned into an accusation. A subtotal equal to the lines is such an amount: it shows the total adds something.
 // - Two full reads are the same model seeing the same gap, so they could make up the same "discount"; the charges read
 //   is not asked to add anything up, so only it confirms an extra row.
 //
-//   The first read is kept if it adds up with no extra rows. If it adds up only with extra rows, the charges are read
-//   on their own. Otherwise the quick model reads the photo again, with the charges read on their own at the same
-//   time. Same lines and total: settled. Same lines, different totals: a narrow read of the written total settles it.
-//   Different lines: the stronger model reads it too. Anything still unclear is shown with the numbers marked.
+//   The first read is kept if it adds up with nothing unconfirmed. If it adds up only with extra rows, the charges are
+//   read on their own first. Otherwise the quick model reads the photo again, with the charges read on their own at
+//   the same time: a second read cannot confirm a row, but it may show a misread line that a made-up row was covering,
+//   and it finds the lines and total a second time. Same lines and total: settled. Same lines, different totals: a
+//   narrow read of the written total settles it. Different lines: the stronger model reads it too. Anything still
+//   unclear is shown with the numbers marked.
 import {
   addingSubset,
   allPriced,
   chargesTotal,
   checkSums,
   disputes,
-  doubtfulSign,
-  isEcho,
+  kindOf,
+  labelDoubt,
   linesTotal,
   looksLikeCharge,
-  opposedLabels,
   naira,
+  sameKind,
   sameLines,
+  withoutEchoes,
   type Charge,
   type Dispute,
   type Invoice,
@@ -76,8 +81,8 @@ type Seen = { row: Charge; fulls: number; narrow: boolean };
 
 /**
  * Every distinct extra row across the full reads and the charges read, matched by amount to the naira (either sign,
- * since readers differ on minus signs) unless their labels clearly name opposite things. A read that lists the same
- * amount twice gives two rows.
+ * since readers differ on minus signs) when their labels could name the same kind of row: one read's payment never
+ * vouches for another read's discount. A read that lists the same amount twice gives two rows.
  */
 export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Seen[] {
   const seen: Seen[] = [];
@@ -85,7 +90,7 @@ export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Se
     const used = new Set<Seen>();
     for (const row of rows) {
       let s = seen.find(
-        (x) => !used.has(x) && Math.abs(Math.abs(x.row.amount) - Math.abs(row.amount)) <= 1 && !opposedLabels(x.row.label, row.label),
+        (x) => !used.has(x) && Math.abs(Math.abs(x.row.amount) - Math.abs(row.amount)) <= 1 && sameKind(x.row.label, row.label),
       );
       if (!s) seen.push((s = { row: { label: row.label, amount: row.amount }, fulls: 0, narrow: false }));
       used.add(s);
@@ -102,38 +107,55 @@ export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Se
  * - adds-if: it adds up only with rows the owner should check (unconfirmed, or counted against their label).
  * - no-way: there are extra rows and no way of counting them makes the total.
  * - clean-mismatch: nothing but lines and a total, and they do not match.
- * - unchecked: no total, or a line with no price, so the total cannot be checked.
+ * - unchecked: no total, or a line whose amount is not written, so the total cannot be checked.
  */
 export type Verdict = "adds" | "adds-if" | "no-way" | "clean-mismatch" | "unchecked";
 export type Resolved = {
   invoice: Invoice;
   verdict: Verdict;
-  /** Counted rows the owner checks, and why. */
-  unsure: { row: Charge; why: "unconfirmed" | "sign" }[];
+  /**
+   * Counted rows the owner checks: not found by the charges read, or counted against their label (`doubt` says how).
+   * `found` is how many full reads listed the row.
+   */
+  unsure: { row: Charge; why: "unconfirmed" | "label"; doubt?: string; found: number }[];
+  /** With no-way: a subtotal on the paper equal to the lines, so the total adds something to them. */
+  subtotal?: Charge;
 };
 
 /** The shown lines and total, with the extra rows weighed across every read (see the rules at the top). */
 export function resolve(shown: Invoice, fulls: Invoice[], narrow: Charge[] | null | undefined): Resolved {
   if (shown.total === null || shown.items.length === 0 || !allPriced(shown)) return { invoice: shown, verdict: "unchecked", unsure: [] };
   const lines = linesTotal(shown);
-  const seen = tally(fulls, narrow).filter((s) => !isEcho(s.row, lines, shown.total));
+  const total = shown.total;
+  const seen = withoutEchoes(
+    tally(fulls, narrow).map((s) => ({ ...s.row, s })),
+    total,
+  ).map((x) => x.s);
   if (!seen.length) {
-    const verdict = Math.abs(lines - shown.total) <= 1 ? "adds" : "clean-mismatch";
+    const verdict = Math.abs(lines - total) <= 1 ? "adds" : "clean-mismatch";
     return { invoice: { ...shown, charges: [], notCounted: [] }, verdict, unsure: [] };
   }
-  const chosen = addingSubset(lines, shown.total, seen.map((s, i) => ({ ...s.row, i })));
+  // On a tie, a row the charges read found wins over one it did not.
+  const chosen = addingSubset(
+    lines,
+    total,
+    seen.map((s, i) => ({ ...s.row, i })),
+    (x) => (seen[x.i].narrow ? 1 : 0),
+  );
   if (!chosen) {
     return {
       invoice: { ...shown, charges: seen.filter((s) => looksLikeCharge(s.row.label)).map((s) => s.row), notCounted: seen.filter((s) => !looksLikeCharge(s.row.label)).map((s) => s.row) },
       verdict: "no-way",
       unsure: [],
+      subtotal: seen.find((s) => kindOf(s.row.label) === "sum" && Math.abs(Math.abs(s.row.amount) - lines) <= 1)?.row,
     };
   }
   const unsure: Resolved["unsure"] = [];
   const charges = chosen.map(({ i, ...row }) => {
-    const why = !seen[i].narrow ? "unconfirmed" : doubtfulSign(row) ? "sign" : null;
+    const doubt = labelDoubt(row) ?? undefined;
+    const why = !seen[i].narrow ? "unconfirmed" : doubt ? "label" : null;
     if (!why) return row;
-    unsure.push({ row, why });
+    unsure.push({ row, why, doubt, found: seen[i].fulls });
     return { ...row, unsure: true as const };
   });
   const notCounted = seen.filter((_, i) => !chosen.some((c) => c.i === i)).map((s) => s.row);
@@ -160,21 +182,31 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
       },
     ));
 
+  // resolve() tries every way of counting the extra rows, so each read is resolved once for what is known so far.
+  const cache = new Map<Invoice, { at: string; r: Resolved }>();
+  const resolved = (x: Invoice): Resolved => {
+    const at = `${fulls.length}${n === undefined ? "" : n === null ? "x" : "y"}`;
+    const hit = cache.get(x);
+    if (hit && hit.at === at) return hit.r;
+    const r = resolve(x, fulls, n);
+    cache.set(x, { at, r });
+    return r;
+  };
+
+  const list = (rows: Charge[]) => rows.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ");
+
   /** The note for rows the owner should check, written where the facts are known. */
   const rowsDispute = (r: Resolved): Dispute => {
-    const list = (rows: Charge[]) => rows.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ");
-    const unconfirmed = r.unsure.filter((u) => u.why === "unconfirmed").map((u) => u.row);
-    const turned = r.unsure.filter((u) => u.why === "sign").map((u) => u.row);
+    const unconfirmed = r.unsure.filter((u) => u.why === "unconfirmed");
     const parts: string[] = [];
     if (unconfirmed.length) {
       const one = unconfirmed.length === 1;
       const because =
         n === undefined ? "the charges were not read on their own" : n === null ? "reading the charges on their own failed" : `the charges read on their own did not find ${one ? "it" : "them"}`;
-      parts.push(`${list(unconfirmed)} ${one ? "is" : "are"} counted, but ${because}.`);
+      const few = one && Array.isArray(n) && fulls.length > 1 && unconfirmed[0].found < fulls.length ? `, and only ${unconfirmed[0].found} of ${fulls.length} full reads did` : "";
+      parts.push(`${list(unconfirmed.map((u) => u.row))} ${one ? "is" : "are"} counted, but ${because}${few}.`);
     }
-    if (turned.length) {
-      parts.push(`${list(turned)} ${turned.length === 1 ? "is" : "are"} counted the other way from what the label says (a discount added, or VAT or delivery taken off).`);
-    }
+    for (const u of r.unsure) if (u.doubt) parts.push(`${list([u.row])} ${u.doubt}.`);
     const total = chargesTotal(r.invoice);
     const without = total - r.unsure.reduce((t, u) => t + u.row.amount, 0);
     const one = r.unsure.length === 1;
@@ -184,13 +216,21 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
     return { line: null, field: "charges", shown: total, other: without, note: parts.join(" ") };
   };
 
+  /** The note when no way of counting the extra rows makes the total; a subtotal equal to the lines says more. */
+  const noWayNote = (r: Resolved) => {
+    const s = r.subtotal;
+    if (!s || r.invoice.total === null) return NO_WAY;
+    const sub = Math.abs(s.amount);
+    return `The paper shows ${s.label} ${naira(sub)}, the same as the lines, but the total says ${naira(r.invoice.total)}. The ${naira(Math.abs(r.invoice.total - sub))} between them may be VAT, delivery, a discount or another amount Snap could not read: check the paper. If nothing else is written there, the total is wrong.`;
+  };
+
   /** The answer for the shown lines and total. */
   const finish = (shown: Invoice, how: { twice: boolean; totalAgain?: boolean; strongAgreed?: boolean; disputes?: Dispute[] }): Settled => {
-    const r = resolve(shown, fulls, n);
+    const r = resolved(shown);
     const out = [...(how.disputes ?? [])];
     let paperError: string | undefined;
     if (r.verdict === "adds-if") out.push(rowsDispute(r));
-    if (r.verdict === "no-way") out.push({ line: null, field: "charges", shown: chargesTotal(r.invoice), other: null, note: NO_WAY });
+    if (r.verdict === "no-way") out.push({ line: null, field: "charges", shown: chargesTotal(r.invoice), other: null, note: noWayNote(r) });
     if (how.twice) {
       const said = how.totalAgain
         ? `The total was read again on its own and came back as ${naira(shown.total)} again.`
@@ -215,7 +255,7 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
   };
 
   const names = (x: Invoice, other: Invoice): Invoice => ({ ...x, supplier: x.supplier ?? other.supplier });
-  const problems = (x: Invoice) => checkSums(resolve(x, fulls, n).invoice).problems.length;
+  const problems = (x: Invoice) => checkSums(resolved(x).invoice).problems.length;
   /** The read to show when two reads differ: fewer problems; on a tie, the later (or stronger) one. An empty read never replaces one with lines. */
   const pick = (a: Invoice, b: Invoice) => (b.items.length === 0 && a.items.length > 0 ? a : problems(b) <= problems(a) ? b : a);
   /** Shows one of two reads that differ, with the supplier from either, and the numbers they disagree on marked. */
@@ -226,7 +266,7 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
   };
 
   // 1. The first read. If it adds up only with extra rows nobody confirmed, the charges are read on their own.
-  let r = resolve(first, fulls, n);
+  let r = resolved(first);
   if (r.unsure.some((u) => u.why === "unconfirmed")) {
     await readCharges();
     steps.push(
@@ -234,17 +274,23 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
         ? `The read listed other amounts (VAT, delivery or a discount), but reading them on their own failed (${nFailed}).`
         : "The read listed other amounts (VAT, delivery or a discount), so they were read again on their own.",
     );
-    r = resolve(first, fulls, n);
+    r = resolved(first);
   }
   const firstCheck = checkSums(r.invoice);
-  // Kept when its numbers hold together: a second full read cannot confirm extra rows (only the charges read can).
-  const settledFirst = firstCheck.ok && (r.verdict === "adds" || r.verdict === "adds-if" || r.verdict === "unchecked");
+  const unconfirmed = r.unsure.filter((u) => u.why === "unconfirmed").map((u) => u.row);
+  // Kept when its numbers hold together with nothing unconfirmed (a row counted against its label stays marked,
+  // whatever is read next). A row that only a full read found is read again, as the rules at the top say.
+  const settledFirst = firstCheck.ok && !unconfirmed.length && (r.verdict === "adds" || r.verdict === "adds-if" || r.verdict === "unchecked");
   if (opts.secondRead === false || (settledFirst && !opts.forceSecond)) return finish(first, { twice: false });
 
   // 2. The quick model reads the photo again; the charges are read on their own at the same time (unless done), so a
   //    VAT or delivery line that both full reads missed is not taken for the supplier's mistake.
   steps.push(
-    !firstCheck.ok ? `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.` : "It was read a second time (test mode).",
+    !firstCheck.ok
+      ? `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.`
+      : unconfirmed.length
+        ? `It adds up only with ${list(unconfirmed)}, which the charges read on their own ${n === null ? "could not check" : "did not find"}, so it was read a second time.`
+        : "It was read a second time (test mode).",
   );
   const chargesNow = n === undefined;
   const [again] = await Promise.all([

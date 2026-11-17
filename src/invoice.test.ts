@@ -1,19 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   addingSubset,
+  allPriced,
   arrange,
   CHARGES_PROMPT,
   chargesFrom,
   checkSums,
   disputes,
-  doubtfulSign,
   INVOICE_JSON_SCHEMA,
-  isEcho,
+  kindOf,
+  labelDoubt,
   looksLikeCharge,
   naira,
   normalize,
-  opposedLabels,
   READ_PROMPT,
+  sameKind,
+  withoutEchoes,
   sameLines,
   trustDeviceRead,
 } from "./invoice";
@@ -195,7 +197,7 @@ describe("extra rows (VAT, delivery, deposits, subtotals, payments)", () => {
   it("keeps every labelled, non-zero row a reader returned; the arithmetic decides which count", () => {
     expect(chargesFrom('{"charges":[{"label":"VAT 7.5%","amount":"12,000"},{"label":"","amount":-500},{"label":"Delivery","amount":0}]}')).toEqual([
       { label: "VAT 7.5%", amount: 12000 },
-      { label: "Charge", amount: -500 },
+      { label: "Other amount", amount: -500 },
     ]);
     expect(chargesFrom({ charges: [] })).toEqual([]);
     expect(chargesFrom({})).toEqual([]);
@@ -252,32 +254,98 @@ describe("labels only ever add doubt", () => {
     expect(addingSubset(50000, 52000, [{ label: "Crate deposit", amount: -2000 }])).toEqual([{ label: "Crate deposit", amount: 2000 }]);
     // Withholding tax and an unlabelled minus count as written.
     expect(addingSubset(100000, 102500, [{ label: "VAT", amount: 7500 }, { label: "Withholding tax", amount: -5000 }])).toHaveLength(2);
-    expect(addingSubset(100000, 99500, [{ label: "Charge", amount: -500 }])).toEqual([{ label: "Charge", amount: -500 }]);
+    expect(addingSubset(100000, 99500, [{ label: "Other amount", amount: -500 }])).toEqual([{ label: "Other amount", amount: -500 }]);
   });
 
-  it("flag a row counted the other way from what its label says, for the owner to check", () => {
-    expect(doubtfulSign({ label: "Discount", amount: 3000 })).toBe(true);
-    expect(doubtfulSign({ label: "Discount", amount: -3000 })).toBe(false);
-    expect(doubtfulSign({ label: "V.A.T 7.5%", amount: -7500 })).toBe(true);
-    expect(doubtfulSign({ label: "Delivery", amount: -2000 })).toBe(true);
-    expect(doubtfulSign({ label: "Withholding tax", amount: -5000 })).toBe(false);
-    expect(doubtfulSign({ label: "Crate deposit", amount: 2000 })).toBe(false);
+  it("know what kind of row a label names, the specific words first", () => {
+    const kinds: [string, string | null][] = [
+      ["VAT 7.5%", "vat"],
+      ["VAT7.5%", "vat"], // written without a space, as handwriting often is
+      ["V.A.T", "vat"],
+      ["Total VAT", "vat"],
+      ["Tax", "vat"],
+      ["Vatable amount", null],
+      ["Withholding tax 5%", "withholding"],
+      ["Transport", "delivery"],
+      ["Loading fee", "delivery"],
+      ["Late payment fee", "fee"],
+      ["Service charge", "fee"],
+      ["Freight", "delivery"],
+      ["Cash discount", "discount"],
+      ["Credit", "discount"],
+      ["Less", "discount"],
+      ["Less: Deposit", "payment"],
+      ["Amount paid", "payment"],
+      ["Deposit", "payment"],
+      ["Crate deposit", "returnable"],
+      ["Previous balance", "brought"],
+      ["Bal b/f", "brought"],
+      ["Balance", "balance"],
+      ["Amount due", "balance"],
+      ["Sub-total", "sum"],
+      ["SUBTOTAL", "sum"],
+      ["Grand Total", "sum"],
+      ["Total excl. VAT", "sum"],
+      ["Total", "sum"],
+      ["Other amount", null],
+    ];
+    for (const [label, kind] of kinds) expect([label, kindOf(label)]).toEqual([label, kind]);
   });
 
-  it("stop a match between rows that clearly name opposite things, and nothing else", () => {
-    expect(opposedLabels("Discount", "Delivery")).toBe(true);
-    expect(opposedLabels("Less", "VAT")).toBe(true);
-    expect(opposedLabels("V.A.T 7.5%", "VAT")).toBe(false);
-    expect(opposedLabels("Charge", "Discount")).toBe(true);
-    expect(opposedLabels("Crate deposit", "Deposit")).toBe(false);
+  it("flag a row counted against its label, for the owner to check", () => {
+    // Added, but reads like money taken off.
+    for (const label of ["Discount", "Amount paid", "Credit", "Deposit", "Advance", "Refund", "Withholding tax"])
+      expect([label, labelDoubt({ label, amount: 5000 })]).toEqual([label, expect.stringMatching(/^is added, but/)]);
+    // Taken off, but reads like something added.
+    for (const label of ["VAT7.5%", "V.A.T 7.5%", "Tax", "Levy", "Freight", "Delivery", "Service fee", "Previous balance"])
+      expect([label, labelDoubt({ label, amount: -5000 })]).toEqual([label, expect.stringMatching(/^is taken off, but/)]);
+    // A total or a balance is never an extra amount, whichever way it is counted.
+    expect(labelDoubt({ label: "Subtotal", amount: 50000 })).toMatch(/^is counted, but its label reads like a total or a balance/);
+    expect(labelDoubt({ label: "Balance", amount: -5000 })).toMatch(/^is counted, but/);
+    // Counted the way its label says, or a label that says nothing: no doubt.
+    for (const row of [
+      { label: "Discount", amount: -3000 },
+      { label: "Withholding tax", amount: -5000 },
+      { label: "Amount paid", amount: -30000 },
+      { label: "Late payment fee", amount: 2000 },
+      { label: "Crate deposit", amount: 2000 },
+      { label: "Crate deposit", amount: -2000 },
+      { label: "Previous balance", amount: 20000 },
+      { label: "Other amount", amount: -500 },
+    ])
+      expect([row.label, labelDoubt(row)]).toEqual([row.label, null]);
   });
 
-  it("know a row that only repeats the total or the lines' sum", () => {
-    expect(isEcho({ label: "Total", amount: 109000 }, 109500, 109000)).toBe(true);
-    expect(isEcho({ label: "Sub-total", amount: 109500 }, 109500, 109000)).toBe(true);
-    expect(isEcho({ label: "Balance", amount: 109000 }, 109500, 109000)).toBe(true);
-    expect(isEcho({ label: "Transport", amount: 5000 }, 5000, 10000)).toBe(false);
-    expect(isEcho({ label: "VAT", amount: 109000 }, 109500, 109000)).toBe(false);
+  it("never take rows of different kinds for the same row", () => {
+    expect(sameKind("V.A.T 7.5%", "VAT")).toBe(true);
+    expect(sameKind("Transport", "Delivery")).toBe(true);
+    expect(sameKind("Less", "Discount")).toBe(true);
+    expect(sameKind("Other amount", "Discount")).toBe(true);
+    expect(sameKind("Discount", "Delivery")).toBe(false);
+    expect(sameKind("Discount", "Paid")).toBe(false);
+    expect(sameKind("VAT", "Delivery")).toBe(false);
+    expect(sameKind("Crate deposit", "Deposit")).toBe(false);
+  });
+
+  it("drop only the rows that repeat the total", () => {
+    const keep = (rows: { label: string; amount: number }[], total: number) => withoutEchoes(rows, total).map((r) => r.label);
+    expect(keep([{ label: "Total", amount: 109000 }, { label: "Balance", amount: 109000 }, { label: "Amount paid", amount: 109000 }], 109000)).toEqual([]);
+    // Payments that together make the total: a deposit and the balance, or cash less change.
+    expect(keep([{ label: "Deposit", amount: 50000 }, { label: "Balance", amount: 59000 }], 109000)).toEqual([]);
+    expect(keep([{ label: "Cash", amount: 120000 }, { label: "Change", amount: 11000 }], 109000)).toEqual([]);
+    // A subtotal equal to the lines is kept: it shows the total adds something to them.
+    expect(keep([{ label: "Sub-total", amount: 109500 }], 109000)).toEqual(["Sub-total"]);
+    // A part payment, a charge equal to the total, or rows that do not make the total are kept.
+    expect(keep([{ label: "Amount paid", amount: 50000 }], 109000)).toEqual(["Amount paid"]);
+    expect(keep([{ label: "VAT", amount: 109000 }], 109000)).toEqual(["VAT"]);
+    expect(keep([{ label: "Deposit", amount: 50000 }, { label: "Balance", amount: 50000 }], 109000)).toEqual(["Deposit", "Balance"]);
+  });
+
+  it("search many rows quickly, even when no way of counting them works", () => {
+    const many = Array.from({ length: 14 }, (_, i) => ({ label: `Row ${i + 1}`, amount: 1000 * (i + 1) }));
+    const start = performance.now();
+    for (let k = 0; k < 10; k++) expect(addingSubset(109500, 109000, many)).toBeNull();
+    expect((performance.now() - start) / 10).toBeLessThan(20);
   });
 });
 
@@ -296,5 +364,26 @@ describe("a quantity nobody wrote", () => {
     expect(c.ok).toBe(true);
     expect(c.notes).toEqual(["Line 1: no quantity was written, so Snap took it as 1; check it."]);
     expect(trustDeviceRead(c)).toBe(false);
+  });
+
+  it("leaves the total unchecked when the line has only a unit price, so a guess of one piece is never summed", () => {
+    // "Rice @ 25,000" with no quantity and no line total, and "3 x 1,000 = 3,000": the paper's ₦53,000 may be right.
+    const rice = normalize({
+      items: [
+        { quantity: null, description: "Rice", unit_price: 25000, line_total: null },
+        { quantity: 3, description: "Salt", unit_price: 1000, line_total: 3000 },
+      ],
+      total: 53000,
+    });
+    expect(rice.items[0]).toMatchObject({ quantity: 1, guessed: true });
+    expect(allPriced(rice)).toBe(false);
+    const c = checkSums(rice);
+    expect(c.ok).toBe(true);
+    expect(c.crossChecked).toBe(false);
+    expect(c.problems).toEqual([]);
+    // Once the owner types the quantity in, the total is checked.
+    const typed = { ...rice, items: [{ ...rice.items[0], quantity: 2, guessed: undefined }, rice.items[1]] };
+    expect(allPriced(typed)).toBe(true);
+    expect(checkSums(typed)).toMatchObject({ ok: true, crossChecked: true });
   });
 });

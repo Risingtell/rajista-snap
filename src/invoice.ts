@@ -105,20 +105,110 @@ const num = (v: unknown): number | null => {
 
 // A row's label is only a hint. Readers copy subtotals, totals, payments and balances among the charges (seen on 16
 // Nov 2026: "SUBTOTAL 160,000" next to "VAT 7.5% 12,000"), and the same word can mean either ("Crate deposit" is a
-// charge, "Less: Deposit" a payment). So the arithmetic decides which rows the total includes (addingSubset); the
-// label only breaks ties, and picks what to show when nothing adds up.
-const PAYMENT = /\b(deposit|advance|balance|bal|b\/f|c\/f|brought\s+forward|carried\s+forward|paid|payments?|amount\s+(due|payable))\b/i;
-const MONEY_HANDED = /\b(cash|change)\b/i;
-const SUMMARY = /\b(sub[\s-]*total|grand[\s-]*total|net[\s-]*total|total)\b/gi;
-const A_CHARGE = /vat|tax|levy|deliver|transport|freight|carriage|loading|discount|rebate|commission|surcharge|fee|charge/i;
+// charge, "Less: Deposit" a payment). So the arithmetic decides which rows the total includes (addingSubset), and a
+// label never decides how a row is counted. It only ever adds doubt: rows of different kinds are never taken for the
+// same row, a row counted against its label is marked for the owner to check, and it breaks ties.
+
+/** What a row's label says it is, as far as a label can tell. */
+export type Kind = "vat" | "withholding" | "delivery" | "fee" | "discount" | "returnable" | "brought" | "payment" | "balance" | "sum";
+
+// The first match wins, so the more specific words come first: "Crate deposit" is returnable, "Late payment fee" a
+// fee, "Cash discount" a discount, "Less: Deposit" a payment, "Previous balance" an old balance brought forward.
+const KINDS: [Kind, RegExp][] = [
+  ["returnable", /crate|bottle|empt(y|ies)|container|pallet|drum/i],
+  ["withholding", /withholding|\bwht\b/i],
+  ["vat", /(?<![a-z])v\.?\s?a\.?\s?t(?![a-z])|\btax|levy|\bduty/i], // "VAT7.5%" and "V.A.T" too
+  ["delivery", /deliver|transport|freight|carriage|haulage|logistic|loading|shipping|courier|dispatch/i],
+  ["discount", /discount|\bdisc\b|rebate|credit|refund|allowance/i],
+  ["brought", /b\/f|brought|previous|\bold\b|arrears/i],
+  ["fee", /fee|charge|commission|surcharge|service|pack(ag)?ing|insurance|handling|labou?r|installation/i],
+  ["payment", /\bpaid\b|payment|deposit|advance|\bcash\b|tender|received|\bchange\b|transfer|\bpos\b/i],
+  ["balance", /balance|\bbal\b|c\/f|carried|outstanding|amount\s+(due|payable)|to\s+pay/i],
+  ["discount", /\bless\b/i],
+];
+
+/** The kind of row a label names, or null when it names none of them. */
+export function kindOf(label: string): Kind | null {
+  // "Sub-total", "Grand total" and "Total excl. VAT" are sums of other amounts, while "Total VAT" or "Total discount"
+  // is the charge itself: the words beside "total" decide.
+  if (/total|\bnet\b|\bgross\b/i.test(label)) {
+    const rest = label.replace(/total|[^a-z]+/gi, " ").trim();
+    if (!rest || /\b(sub|grand|net|gross|excl\w*|incl\w*|before|after|amount|goods|invoice|items?|due|payable|value)\b/i.test(rest)) return "sum";
+  }
+  for (const [kind, words] of KINDS) if (words.test(label)) return kind;
+  return null;
+}
 
 /** Whether a row's label reads like a charge (VAT, delivery, a discount) rather than a sum, a payment or a balance. */
 export function looksLikeCharge(label: string): boolean {
-  if (PAYMENT.test(label)) return false; // "Less: Deposit", "Advance paid", "Previous balance", "Bal b/f"
-  const rest = label.replace(SUMMARY, " ");
-  if (rest !== label && !A_CHARGE.test(rest)) return false; // "Subtotal", "Grand total"; but "Total VAT" is VAT
-  if (MONEY_HANDED.test(label) && !A_CHARGE.test(label)) return false; // "Cash", "Change"; but "Cash discount" is one
-  return true;
+  const kind = kindOf(label);
+  return kind !== "sum" && kind !== "payment" && kind !== "balance" && kind !== "brought";
+}
+
+/** Whether two labels could name the same row: always, unless both name a kind and the kinds differ. */
+export function sameKind(a: string, b: string): boolean {
+  const x = kindOf(a);
+  const y = kindOf(b);
+  return x === null || y === null || x === y;
+}
+
+/** Which way each kind of row usually goes: added to the total (1), taken off (-1), either (0), or never (null). */
+const WAY: Record<Kind, 1 | -1 | 0 | null> = {
+  vat: 1,
+  delivery: 1,
+  fee: 1,
+  brought: 1,
+  withholding: -1,
+  discount: -1,
+  payment: -1,
+  returnable: 0,
+  sum: null,
+  balance: null,
+};
+
+/**
+ * Why a counted row's label casts doubt on how it was counted, or null: a discount or a payment added, VAT, delivery
+ * or a fee taken off, or a total or a balance counted at all. This can only make Snap more careful (an orange "check
+ * this" instead of "all clear"), never blame a supplier and never clear an invoice.
+ */
+export function labelDoubt(row: Charge): string | null {
+  const kind = kindOf(row.label);
+  if (!kind) return null;
+  const way = WAY[kind];
+  if (way === null) return "is counted, but its label reads like a total or a balance, not an extra amount";
+  if (way === 1 && row.amount < 0) return "is taken off, but its label reads like something added (VAT, delivery, a fee or an old balance)";
+  if (way === -1 && row.amount > 0) return "is added, but its label reads like something taken off (a discount or a payment)";
+  return null;
+}
+
+/**
+ * The rows that are more than repeats of the total. A total, balance or payment equal to the total repeats it
+ * ("Total 109,000", "Amount paid 109,000"), and so do payment rows that together make it ("Deposit" and "Balance",
+ * or "Cash" less "Change"). A subtotal equal to the lines is not a repeat: it shows the total adds something to them.
+ */
+export function withoutEchoes<T extends Charge>(rows: T[], total: number): T[] {
+  const near = (x: number) => Math.abs(x - total) <= 1;
+  const paying = (r: T) => {
+    const kind = kindOf(r.label);
+    return kind === "payment" || kind === "balance";
+  };
+  const rest = rows.filter((r) => !((paying(r) || kindOf(r.label) === "sum") && near(Math.abs(r.amount))));
+  const post = rest.filter(paying).slice(0, 6);
+  let group: T[] = [];
+  const set: T[] = [];
+  const walk = (i: number, sum: number) => {
+    if (i === post.length) {
+      if (set.length >= 2 && set.length > group.length && near(sum)) group = [...set];
+      return;
+    }
+    set.push(post[i]);
+    walk(i + 1, sum + Math.abs(post[i].amount));
+    walk(i + 1, sum - Math.abs(post[i].amount));
+    set.pop();
+    walk(i + 1, sum);
+  };
+  walk(0, 0);
+  return rest.filter((r) => !group.includes(r));
 }
 
 /** Every extra row in whatever a model returned: labelled, non-zero amounts. Which ones count is decided later. */
@@ -127,66 +217,45 @@ export function chargesFrom(raw: unknown): Charge[] {
   return (Array.isArray(o?.charges) ? o.charges : [])
     .map((c) => {
       const r = (c ?? {}) as Record<string, unknown>;
-      return { label: String(r.label ?? "").replace(/\s+/g, " ").trim() || "Charge", amount: num(r.amount) };
+      return { label: String(r.label ?? "").replace(/\s+/g, " ").trim() || "Other amount", amount: num(r.amount) };
     })
     .filter((c): c is Charge => c.amount !== null && c.amount !== 0);
 }
 
-/** The sum of the line totals (a line with no total counts as quantity × unit price, if it has one). */
-export const linesTotal = (inv: Pick<Invoice, "items">) =>
-  inv.items.reduce((s, l) => s + (l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : 0)), 0);
-
-/** At most this many extra rows are tried. */
-export const MAX_ROWS = 12;
-
 /**
- * Whether a row's label says it goes the other way from how it was counted: a discount added to the total, or VAT or
- * delivery taken off it. Labels are only hints, so this can only make Snap more careful (an orange "check this"
- * instead of "all clear"), never blame a supplier and never clear an invoice.
+ * A line's amount, when it can be told: its written total, or quantity × unit price when the quantity was written.
+ * A unit price with no quantity written and no line total cannot be told (Snap's guess of one piece is only a guess).
  */
-export function doubtfulSign(row: Charge): boolean {
-  if (row.amount > 0) return /discount|rebate|\bless\b/i.test(row.label);
-  return /\bv\.?\s?a\.?\s?t\b|deliver|transport/i.test(row.label);
-}
+export const lineAmount = (l: Line): number | null => l.line_total ?? (l.unit_price !== null && !l.guessed ? l.quantity * l.unit_price : null);
 
-const TAKES_OFF = /discount|rebate|\bless\b/i;
-const ADDS_ON = /\bv\.?\s?a\.?\s?t\b|tax|levy|deliver|transport|fee|charge/i;
-/**
- * Whether two labels clearly name opposite things (a discount against VAT, delivery or a fee). Rows like that are
- * never taken for the same row, even at the same amount, so one read's delivery line never vouches for another
- * read's discount. Labels only ever stop such a match; they never make one.
- */
-export const opposedLabels = (a: string, b: string) => (TAKES_OFF.test(a) && ADDS_ON.test(b)) || (ADDS_ON.test(a) && TAKES_OFF.test(b));
+/** The sum of the lines' amounts (see lineAmount). */
+export const linesTotal = (inv: Pick<Invoice, "items">) => inv.items.reduce((s, l) => s + (lineAmount(l) ?? 0), 0);
 
-/**
- * A row that only repeats the total or the lines' sum ("Total 109,000", "Subtotal 109,500", "Balance" equal to the
- * total when nothing was paid). It adds no information, so it does not count as another amount on the paper.
- */
-export function isEcho(row: Charge, lines: number, total: number | null): boolean {
-  const near = (x: number) => Math.abs(Math.abs(row.amount) - x) <= 1;
-  if (total !== null && near(total) && /total|balance|amount due|to pay/i.test(row.label)) return true;
-  return lines > 0 && near(lines) && /sub/i.test(row.label);
-}
+/** At most this many extra rows are tried (three ways each). Real invoices have a handful. */
+export const MAX_ROWS = 10;
 
 /**
  * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. Each row is left
  * out, counted as written, or counted with its sign turned (a discount written without a minus sign). When several
  * choices work, the one with the most rows that read like charges, and the fewest that read like sums or payments,
- * wins; then the one that turns fewer signs; then the one with fewer rows.
+ * wins; then the one that turns fewer signs; then the one with fewer rows. `bonus` can favour some rows on a tie.
  */
-export function addingSubset<T extends Charge>(lines: number, total: number, rows: T[]): T[] | null {
+export function addingSubset<T extends Charge>(lines: number, total: number, rows: T[], bonus?: (row: T) => number): T[] | null {
   // Worked out once per row, not at every step of the search.
   const list = rows.slice(0, MAX_ROWS).map((r) => ({
     r,
     // A charge-like row counts for; a "total" label (a summary of others) slightly less; a sum or payment against.
-    weight: looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200,
+    weight: (looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200) + (bonus?.(r) ?? 0),
   }));
+  // How far the rows from each one on can still move the sum: a branch that cannot close the gap is not searched.
+  const reach = list.map((_, i) => list.slice(i).reduce((s, x) => s + Math.abs(x.r.amount), 0)).concat(0);
   const found: { best: { set: T[]; score: number } | null } = { best: null };
   const set: T[] = [];
   const walk = (i: number, sum: number, score: number) => {
+    if (Math.abs(lines + sum - total) > reach[i] + 1) return;
     if (i === list.length) {
       const s = score - set.length;
-      if (Math.abs(lines + sum - total) <= 1 && (!found.best || s > found.best.score)) found.best = { set: [...set], score: s };
+      if (!found.best || s > found.best.score) found.best = { set: [...set], score: s };
       return;
     }
     const { r, weight } = list[i];
@@ -202,8 +271,8 @@ export function addingSubset<T extends Charge>(lines: number, total: number, row
   return found.best ? found.best.set : null;
 }
 
-/** Whether every line has a price (a total or a unit price): only then can the invoice total be checked. */
-export const allPriced = (inv: Pick<Invoice, "items">) => inv.items.every((l) => l.line_total !== null || l.unit_price !== null);
+/** Whether every line's amount can be told (see lineAmount): only then can the invoice total be checked. */
+export const allPriced = (inv: Pick<Invoice, "items">) => inv.items.every((l) => lineAmount(l) !== null);
 
 /** The same row, whichever way its sign was taken. */
 export const sameRow = (a: Charge, b: Charge) => a.label === b.label && Math.abs(Math.abs(a.amount) - Math.abs(b.amount)) <= 1;
@@ -288,7 +357,7 @@ export function checkSums(inv: Invoice): Check {
   inv.items.forEach((l, i) => {
     if (l.guessed) notes.push(`Line ${i + 1}: no quantity was written, so Snap took it as ${l.quantity}; check it.`);
     if (l.quantity <= 0) problems.push(`Line ${i + 1}: the quantity ${l.quantity} cannot be right.`);
-    const lineTotal = l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : null);
+    const lineTotal = lineAmount(l);
     if (l.unit_price !== null && l.line_total !== null && l.quantity > 0 && !l.guessed) {
       const product = l.quantity * l.unit_price;
       const gap = l.line_total - product;
