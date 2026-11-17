@@ -69,7 +69,11 @@ export function isAliasOf(saved: string, supplier: string | null, text: string):
   const bar = saved.indexOf("|");
   if (bar < 0 || saved.slice(bar + 1) !== w) return false;
   const was = saved.slice(0, bar);
-  return supplierKey(was) === supplierKey(supplier) || was === (supplier ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (supplierKey(was) === supplierKey(supplier)) return true;
+  // On 16 Nov only a to z and digits were kept. A name with none of them was saved with an empty supplier, which
+  // cannot be told from "no supplier", so it is not matched.
+  const ascii = (supplier ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return ascii !== "" && was === ascii;
 }
 
 export type Match = { product: Product; score: number; how: "learned" | "name" } | null;

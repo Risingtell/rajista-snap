@@ -37,7 +37,12 @@ export async function pickOnDevice(supplier: string | null, line: string, candid
   return onDevice(async (queue) => {
     try {
       const r = await timed((limit) => promptOnDevice(PICK_SESSION, PICK_SCHEMA, pickPrompt(supplier, line, candidates), queue, limit), PICK_TIMEOUT_MS);
-      const n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
+      let n = NaN;
+      try {
+        n = Number((JSON.parse(r.response.text()) as { choice?: unknown }).choice);
+      } catch {
+        /* an answer that is not JSON is no pick */
+      }
       return Number.isInteger(n) && n >= 1 && n <= candidates.length ? candidates[n - 1] : null;
     } catch (e) {
       if (/no answer after/.test(String((e as Error)?.message ?? e))) picksOff = true;

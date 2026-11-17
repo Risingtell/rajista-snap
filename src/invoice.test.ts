@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHARGES_PROMPT, chargesFrom, checkSums, cleanCharges, disputes, isChargeLabel, naira, normalize, reconcile, sameLines, sameNumbers, settleTotal, totalOnlyDispute, trustDeviceRead } from "./invoice";
+import { addingSubset, arrange, CHARGES_PROMPT, chargesFrom, checkSums, disputes, looksLikeCharge, naira, normalize, sameLines, trustDeviceRead } from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -27,7 +27,7 @@ describe("checkSums", () => {
   it("allows half a naira per unit for a unit price rounded to the naira (a carton split per piece)", () => {
     const split = checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13000 }], total: 13000 }));
     expect(split.ok).toBe(true);
-    expect(split.notes).toEqual(["Line 1: 12 × ₦1,083 is ₦12,996, but the line says ₦13,000 (₦4 more). A rounded unit price can explain that much; check the line total against the paper."]);
+    expect(split.notes).toEqual(["Line 1: 12 × ₦1,083 is ₦12,996, but the line says ₦13,000 (₦4 more). A rounded unit price could explain that much, but check the line total against the paper before you pay."]);
     expect(trustDeviceRead(split)).toBe(false);
     expect(checkSums(normalize({ items: [{ quantity: 12, description: "Indomie (pieces)", unit_price: 1083, line_total: 13100 }], total: 13100 })).ok).toBe(false);
   });
@@ -91,11 +91,11 @@ describe("checkSums", () => {
     // Within half a naira per piece, plus half a naira: a note to check, never "does not add up".
     const c = sums(100, 250, 25040);
     expect(c.ok).toBe(true);
-    expect(c.notes).toEqual(["Line 1: 100 × ₦250 is ₦25,000, but the line says ₦25,040 (₦40 more). A rounded unit price can explain that much; check the line total against the paper."]);
+    expect(c.notes).toEqual(["Line 1: 100 × ₦250 is ₦25,000, but the line says ₦25,040 (₦40 more). A rounded unit price could explain that much, but check the line total against the paper before you pay."]);
     expect(sums(100, 333, 33333).notes).toHaveLength(1); // 3 for ₦1,000, with the line total rounded too
     expect(sums(12, 1000, 12006).notes).toHaveLength(1);
     expect(sums(1000, 250, 250499).notes).toEqual([
-      "Line 1: 1000 × ₦250 is ₦250,000, but the line says ₦250,499 (₦499 more). A rounded unit price can explain that much; check the line total against the paper.",
+      "Line 1: 1000 × ₦250 is ₦250,000, but the line says ₦250,499 (₦499 more). A rounded unit price could explain that much, but check the line total against the paper before you pay.",
     ]);
     // Beyond what rounding can explain: the check fails.
     const big = sums(1000, 250, 250600);
@@ -103,6 +103,11 @@ describe("checkSums", () => {
     expect(big.notes).toEqual([]);
     expect(big.problems[0]).toBe("Line 1: 1000 × ₦250 is ₦250,000, not ₦250,600.");
     expect(sums(12, 1000, 12007).ok).toBe(false);
+    // A unit price written with kobo was not rounded to the naira: no allowance per piece.
+    expect(sums(2000, 250.5, 501000).ok).toBe(true);
+    expect(sums(2000, 250.5, 501500).ok).toBe(false);
+    // A whole-naira price on 2,000 pieces: a ₦1,000 gap is within rounding, so a note to check before paying.
+    expect(sums(2000, 250, 501000).notes[0]).toMatch(/\(₦1,000 more\)\. A rounded unit price could explain that much, but check the line total against the paper before you pay\.$/);
   });
 
   it("rejects an empty read", () => {
@@ -117,7 +122,7 @@ describe("checkSums", () => {
 describe("normalize", () => {
   it("cleans numbers written as text and joins broken descriptions", () => {
     const inv = normalize({ items: [{ quantity: "3", description: " HP Laptop\n 14 ", unit_price: "₦595,000", line_total: "1,785,000" }], total: "N1,785,000" });
-    expect(inv).toEqual({ supplier: null, items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], charges: [], total: 1785000 });
+    expect(inv).toEqual({ supplier: null, items: [{ quantity: 3, description: "HP Laptop 14", unit_price: 595000, line_total: 1785000 }], charges: [], notCounted: [], total: 1785000 });
   });
 
   it("accepts a JSON string", () => {
@@ -129,166 +134,96 @@ describe("normalize", () => {
   });
 });
 
-describe("sameNumbers", () => {
-  // Alhaji Musa invoice 1 (16 Nov sample): the lines add up to 109,500, but the trader wrote 109,000.
-  const paper = { supplier: null, items: [
-    { quantity: 2, description: "Ctn. Sugar 1kg", unit_price: 30000, line_total: 60000 },
-    { quantity: 3, description: "Ctn. Indo Chkn 70g", unit_price: 9500, line_total: 28500 },
-    { quantity: 1, description: "Ctn Peak Tin 160g", unit_price: 21000, line_total: 21000 },
-  ], total: 109000 };
+describe("disputes", () => {
+  const quick = {
+    supplier: null,
+    items: [
+      { quantity: 2, description: "Ctn. Sugar 1kg", unit_price: 30000, line_total: 60000 },
+      { quantity: 3, description: "Ctn. Indo", unit_price: 9500, line_total: 28500 },
+      { quantity: 1, description: "Ctn Peak Tin 160g", unit_price: 21000, line_total: 21000 },
+    ],
+    total: 109000,
+  };
 
-  it("sees that two readers agree, so the paper itself does not add up", () => {
-    const other = { ...paper, items: paper.items.map((l) => ({ ...l, description: l.description.toUpperCase() })) };
-    expect(sameNumbers(paper, other)).toBe(true);
-    expect(checkSums(paper).problems).toEqual(["The lines add up to ₦109,500, but the invoice total says ₦109,000."]);
-  });
-
-  it("notices when a reader changed a number", () => {
-    expect(sameNumbers(paper, { ...paper, total: 109500 })).toBe(false);
-  });
-});
-
-describe("reconcile", () => {
-  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
-  // Alhaji Musa invoice 1 as written: the lines make 109,500, the trader wrote 109,000.
-  const quick = { supplier: null, items: [line(2, "Ctn. Sgar 1kg", 30000, 60000), line(3, "Ctn. Indo Chkn 70g", 9500, 28500), line(1, "Ctn Peak Tin 160g", 21000, 21000)], total: 109000 };
-
-  it("confirms a paper error only when both reads found the same numbers, keeping the stronger read's names", () => {
-    const strong = { ...quick, supplier: "Alhaji Musa Wholesale", items: quick.items.map((l, i) => (i === 0 ? { ...l, description: "Ctn. Sugar 1kg" } : l)) };
-    const r = reconcile(quick, strong);
-    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. Snap read the photo twice and got the same numbers both times\. Check these numbers against the paper/);
-    expect(r.paperError).toContain("check it with the supplier before you pay");
-    expect(r.invoice.items[0].description).toBe("Ctn. Sugar 1kg");
-    expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
-    expect(r.disputes).toEqual([]);
-  });
-
-  it("does not blame the paper when the quick read simply misread the total", () => {
-    const misread = { ...quick, total: 108500 };
-    const right = { ...quick, total: 109500 };
-    const r = reconcile(misread, right);
-    expect(r.paperError).toBeUndefined();
-    expect(r.invoice.total).toBe(109500);
-    expect(r.disputes).toEqual([{ line: null, field: "total", shown: 109500, other: 108500 }]);
-  });
-
-  it("flags every number a stronger read changed, so a 'corrected' line cannot slip through unseen", () => {
-    const paper = { supplier: null, items: [line(3, "Milo", 1500, 4000), line(1, "Salt", 8000, 8000)], total: 12000 };
-    const fixed = { supplier: null, items: [line(3, "Milo", 1500, 4500), line(1, "Salt", 8000, 8000)], total: 12500 };
-    const r = reconcile(paper, fixed);
-    expect(r.paperError).toBeUndefined();
-    expect(r.disputes).toEqual([
-      { line: 0, field: "line_total", shown: 4500, other: 4000 },
-      { line: null, field: "total", shown: 12500, other: 12000 },
+  it("lists each number two reads disagree on", () => {
+    const other = { ...quick, items: [{ ...quick.items[0], line_total: 61000 }, ...quick.items.slice(1)], total: 109500 };
+    expect(disputes(quick, other)).toEqual([
+      { line: 0, field: "line_total", shown: 60000, other: 61000 },
+      { line: null, field: "total", shown: 109000, other: 109500 },
     ]);
-  });
-
-  it("handles a second read with no total without inventing a sum", () => {
-    const r = reconcile(quick, { ...quick, total: null });
-    expect(r.paperError).toBeUndefined();
-    expect(r.disputes).toEqual([{ line: null, field: "total", shown: null, other: 109000 }]);
   });
 
   it("reports a different number of lines as a dispute on the line count", () => {
     expect(disputes(quick, { ...quick, items: quick.items.slice(0, 2) })).toEqual([{ line: null, field: "lines", shown: 3, other: 2 }]);
   });
 
-  it("sameLines ignores the total; sameNumbers does not", () => {
-    expect(sameLines(quick, { ...quick, total: 1 })).toBe(true);
-    expect(sameNumbers(quick, { ...quick, total: 1 })).toBe(false);
+  it("sameLines compares the numbers on each line, not the names or the total", () => {
+    expect(sameLines(quick, { ...quick, total: 1, items: quick.items.map((l) => ({ ...l, description: "x" })) })).toBe(true);
+    expect(sameLines(quick, { ...quick, items: [{ ...quick.items[0], quantity: 3 }, ...quick.items.slice(1)] })).toBe(false);
   });
 });
 
 describe("naira", () => {
-  it("formats amounts and shows a chosen word for a missing one", () => {
+  it("writes amounts the way shop owners do", () => {
     expect(naira(109500)).toBe("₦109,500");
     expect(naira(null)).toBe("");
-    expect(naira(null, "none")).toBe("none");
+    expect(naira(null, "₦0")).toBe("₦0");
   });
 });
 
-describe("reconcile edge cases", () => {
-  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
-  const quick = { supplier: null, items: [line(2, "Sugar", 30000, 60000), line(3, "Indo", 9500, 28500), line(1, "Peak", 21000, 21000)], total: 109000 };
+describe("extra rows (VAT, delivery, deposits, subtotals, payments)", () => {
+  const goods = [{ quantity: 4, description: "Ctn Milo 400g", unit_price: 40000, line_total: 160000 }];
+  const vat = { label: "VAT 7.5%", amount: 12000 };
 
-  it("never lets an empty stronger read replace a read that found lines", () => {
-    const r = reconcile(quick, { supplier: null, items: [], total: null });
-    expect(r.invoice.items).toHaveLength(3);
-  });
-
-  it("keeps the read with fewer problems, and shows the second (stronger) read on a tie", () => {
-    const worse = { supplier: null, items: [line(2, "Sugar", 30000, 61000), line(3, "Indo", 9500, 28500), line(1, "Peak", 21000, 21000)], total: 100000 };
-    expect(reconcile(quick, worse).invoice.items[0].line_total).toBe(60000);
-    const tie = { ...quick, items: quick.items.map((l, i) => (i === 1 ? { ...l, description: "Indomie" } : l)), total: 108000 };
-    expect(reconcile(quick, tie).invoice.total).toBe(108000);
-  });
-});
-
-describe("settleTotal (a third, narrow read of the written total)", () => {
-  const line = (quantity: number, description: string, unit_price: number | null, line_total: number | null) => ({ quantity, description, unit_price, line_total });
-  const items = [line(2, "Ctn. Sugar 1kg", 30000, 60000), line(3, "Ctn. Indo Chkn 70g", 9500, 28500), line(1, "Ctn Peak Tin 160g", 21000, 21000)];
-  const copied = { supplier: null, items, total: 109000 }; // copied the paper faithfully: does not add up
-  const fixed = { supplier: "Alhaji Musa Wholesale", items, total: 109500 }; // "corrected" the sum: adds up
-
-  it("recognises a total-only dispute", () => {
-    expect(totalOnlyDispute(copied, fixed)).toBe(true);
-    expect(totalOnlyDispute(copied, { ...fixed, total: 109000 })).toBe(false);
-  });
-
-  it("confirms the paper's error when the written total matches the read that does not add up", () => {
-    const r = settleTotal(copied, fixed, 109000);
-    expect(r.invoice.total).toBe(109000);
-    expect(r.invoice.supplier).toBe("Alhaji Musa Wholesale");
-    expect(r.paperError).toMatch(/^The lines add up to ₦109,500, but the invoice total says ₦109,000\. The total was read again on its own and came back as ₦109,000 again\. Check these numbers against the paper/);
-    expect(r.disputes).toEqual([]);
-  });
-
-  it("trusts the read that adds up when the written total matches it (the quick read misread)", () => {
-    const misread = { ...copied, total: 108500 };
-    const right = { ...fixed, total: 109500 };
-    const r = settleTotal(misread, right, 109500);
-    expect(r.invoice.total).toBe(109500);
-    expect(r.paperError).toBeUndefined();
-    expect(r.disputes).toEqual([]);
-  });
-
-  it("leaves the total for the owner to check when the third read agrees with neither", () => {
-    const r = settleTotal(copied, fixed, 190000);
-    expect(r.paperError).toBeUndefined();
-    expect(r.disputes).toEqual([{ line: null, field: "total", shown: 109500, other: 109000 }]);
-  });
-});
-
-describe("chargesFrom", () => {
-  it("keeps labelled, non-zero charges as written", () => {
+  it("keeps every labelled, non-zero row a reader returned; the arithmetic decides which count", () => {
     expect(chargesFrom('{"charges":[{"label":"VAT 7.5%","amount":"12,000"},{"label":"","amount":-500},{"label":"Delivery","amount":0}]}')).toEqual([
       { label: "VAT 7.5%", amount: 12000 },
       { label: "Charge", amount: -500 },
     ]);
     expect(chargesFrom({ charges: [] })).toEqual([]);
-    // A subtotal, total or payment copied into the charges is dropped; a VAT total is still a charge.
-    const copied = { charges: [{ label: "SUBTOTAL", amount: 160000 }, { label: "VAT 7.5%", amount: 12000 }, { label: "Grand Total", amount: 172000 }, { label: "Amount Paid", amount: 100000 }, { label: "Balance", amount: 72000 }, { label: "Total VAT", amount: 12000 }, { label: "Delivery", amount: 2000 }] };
-    expect(chargesFrom(copied).map((c) => c.label)).toEqual(["VAT 7.5%", "Total VAT", "Delivery"]);
     expect(chargesFrom({})).toEqual([]);
-    // Payments and balances, wherever the word sits in the label; a cash discount is still a discount.
-    const payments = ["Less: Deposit", "Advance paid", "Previous balance", "Bal b/f", "Part payment", "Cash", "Change"];
-    for (const label of payments) expect(isChargeLabel(label)).toBe(false);
-    for (const label of ["VAT", "Total VAT", "Cash discount", "Delivery", "Transport", "Loading fee", "Total charges"]) expect(isChargeLabel(label)).toBe(true);
   });
 
-  it("drops a sum or total copied as a charge, and a summary of the other charges, for every read", () => {
-    const items = [{ quantity: 4, description: "Ctn Milo 400g", unit_price: 40000, line_total: 160000 }];
-    const vat = { label: "VAT 7.5%", amount: 12000 };
-    expect(cleanCharges({ items, total: 172000 }, [{ label: "Amount excl. VAT", amount: 160000 }, vat, { label: "Total incl. VAT", amount: 172000 }])).toEqual([vat]);
-    const delivery = { label: "Delivery", amount: 5000 };
-    expect(cleanCharges({ items, total: 177000 }, [vat, delivery, { label: "Total charges", amount: 17000 }])).toEqual([vat, delivery]);
-    // A full read gets the same cleaning, so a copied total cannot make a correct invoice look wrong.
-    const read = normalize({ items, charges: [vat, { label: "Total incl. VAT", amount: 172000 }], total: 172000 });
+  it("reads labels only as a hint: payments, balances and sums do not read like charges", () => {
+    for (const label of ["SUBTOTAL", "Grand Total", "Amount Paid", "Balance", "Less: Deposit", "Advance paid", "Previous balance", "Bal b/f", "Part payment", "Cash", "Change"])
+      expect(looksLikeCharge(label)).toBe(false);
+    for (const label of ["VAT", "Total VAT", "Cash discount", "Delivery", "Transport", "Loading fee", "Total charges"]) expect(looksLikeCharge(label)).toBe(true);
+  });
+
+  it("finds the rows the total really includes, whatever their labels", () => {
+    // A subtotal copied among the charges (seen 16 Nov 2026) is left out because the sum says so.
+    expect(addingSubset(160000, 172000, [{ label: "SUBTOTAL", amount: 160000 }, vat])).toEqual([vat]);
+    // Transport equal to the goods: still counted, because the total includes it.
+    expect(addingSubset(5000, 10000, [{ label: "Transport", amount: 5000 }])).toEqual([{ label: "Transport", amount: 5000 }]);
+    // A crate deposit is a charge; a customer's deposit is a payment: the total tells them apart.
+    const crate = { label: "Crate deposit", amount: 2000 };
+    expect(addingSubset(48000, 50000, [crate, { label: "Amount paid", amount: 30000 }])).toEqual([crate]);
+    expect(addingSubset(100000, 100000, [{ label: "Less: Deposit", amount: 50000 }, { label: "Balance", amount: 50000 }])).toEqual([]);
+    // A summary row among real ones: the combination that adds up wins.
+    const discount = { label: "Discount", amount: -5000 };
+    const vat2 = { label: "VAT", amount: 7125 };
+    expect(addingSubset(100000, 102125, [discount, { label: "Total excl. VAT", amount: 95000 }, vat2])).toEqual([discount, vat2]);
+    // An old balance carried onto the total counts too.
+    expect(addingSubset(100000, 120000, [{ label: "Previous balance", amount: 20000 }])).toEqual([{ label: "Previous balance", amount: 20000 }]);
+    // Nothing adds up: null.
+    expect(addingSubset(109500, 109000, [])).toBeNull();
+    // Two equal rows, one of them a summary of the other: only one is counted.
+    expect(addingSubset(100000, 107500, [{ label: "VAT", amount: 7500 }, { label: "Total VAT", amount: 7500 }])).toEqual([{ label: "VAT", amount: 7500 }]);
+  });
+
+  it("splits one read's rows into the ones its total includes and the rest", () => {
+    const inv = { supplier: null, items: goods, total: 172000 };
+    const sub = { label: "SUBTOTAL", amount: 160000 };
+    expect(arrange(inv, [sub, vat])).toEqual({ ...inv, charges: [vat], notCounted: [sub] });
+    // A full read is cleaned the same way, so a copied total cannot make a correct invoice look wrong.
+    const read = normalize({ items: goods, charges: [vat, { label: "Total incl. VAT", amount: 172000 }], total: 172000 });
     expect(read.charges).toEqual([vat]);
     expect(checkSums(read).ok).toBe(true);
+    // Nothing adds up: the rows that read like charges are shown, the rest kept aside.
+    expect(arrange({ ...inv, total: 180000 }, [sub, vat])).toEqual({ ...inv, total: 180000, charges: [vat], notCounted: [sub] });
   });
 
-  it("asks for the charges only, without adding anything up", () => {
+  it("asks the charges-only read for charges, without adding anything up", () => {
     expect(CHARGES_PROMPT).toMatch(/Do not add anything up/);
   });
 });

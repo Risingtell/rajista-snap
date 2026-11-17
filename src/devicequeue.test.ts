@@ -69,6 +69,24 @@ describe("onDevice", () => {
     expect(await read2).toBe("read");
   });
 
+  it("lets a reading that arrives while a match waits for Chrome go first", async () => {
+    const slowToStop = (signal: AbortSignal) =>
+      new Promise<string>((_, no) => signal.addEventListener("abort", () => setTimeout(() => no(new Error("stopped")), 60), { once: true }));
+    const pick = onDevice(slowToStop);
+    await later(5, 0);
+    const read = onDevice(async () => "read 1", "read", 500); // cancels the match, waits for Chrome to let go
+    await expect(pick).rejects.toThrow();
+    expect(await read).toBe("read 1");
+    // A new match queued while Chrome lets go of a cancelled one, then a reading: the reading still goes first.
+    const pick2 = onDevice(slowToStop);
+    await later(5, 0);
+    const queued = onDevice(async () => "late match", "pick", 500);
+    const read2 = onDevice(async () => "read 2", "read", 500);
+    await expect(pick2).rejects.toThrow();
+    await expect(queued).rejects.toThrow("A reading is waiting");
+    expect(await read2).toBe("read 2");
+  });
+
   it("keeps going after a job fails", async () => {
     await expect(onDevice(async () => Promise.reject(new Error("no model")))).rejects.toThrow("no model");
     expect(await onDevice(async () => "next")).toBe("next");

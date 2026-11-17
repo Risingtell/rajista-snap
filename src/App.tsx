@@ -174,12 +174,13 @@ export function App() {
         if (m.best) continue;
         const candidates = m.others.length ? m.others : pool.length <= 15 ? pool : [];
         if (!candidates.length) continue;
-        let id = "none";
+        let id: string;
         try {
           id = (await pickOnDevice(inv.supplier, inv.items[i].description, candidates))?.id ?? "none";
         } catch {
-          /* no on-device answer (a reading took the device, or picks are too slow here): the owner picks */
-          if (deviceReadWaiting() || busyRef.current || deviceSlow() || devicePicksOff()) return;
+          // The device could not answer (a reading took it, it is busy or too slow): stop, and leave the lines
+          // undecided so the owner picks, or the device tries again after the next reading.
+          return;
         }
         if (!stop) setDevicePicks((d) => Object.assign([...d], { [i]: { key, id } }));
       }
@@ -278,7 +279,6 @@ export function App() {
   const check = invoice ? checkSums(invoice) : null;
   /** What the other cloud read found for this number, when the two reads disagree on it. */
   const other = (line: number | null, field: Dispute["field"]) => reading?.disputes?.find((d) => d.line === line && d.field === field);
-  const chargesDisputed = !!reading?.disputes?.some((d) => d.field === "charges");
 
   return (
     <div className="shell">
@@ -396,7 +396,7 @@ export function App() {
                       <td className="num">
                         <MoneyInput
                           label={`${c.label}, amount`}
-                          flagged={chargesDisputed}
+                          flagged={c.unsure === true}
                           value={c.amount}
                           onChange={(v) =>
                             setInvoice({
@@ -586,8 +586,9 @@ function DisputesNote({ disputes, invoice }: { disputes: Dispute[]; invoice: Inv
   const marked = disputes.filter((d) => d.field !== "lines" && d.field !== "charges").length;
   const lines = disputes.find((d) => d.field === "lines");
   const charges = disputes.find((d) => d.field === "charges");
-  const twoReads = disputes.some((d) => d.field !== "charges" || d.other !== null);
-  const chargeRows = charges !== undefined && charges.shown !== 0 && charges.shown !== null;
+  const twoReads = disputes.some((d) => d.field !== "charges");
+  const unsure = (invoice.charges ?? []).filter((c) => c.unsure);
+  const chargeRows = unsure.length > 0;
   return (
     <div className="disputes" role="status">
       <b>Check this invoice against the paper.</b>
@@ -595,9 +596,10 @@ function DisputesNote({ disputes, invoice }: { disputes: Dispute[]; invoice: Inv
       {lines && ` One found ${lines.shown} lines and the other ${lines.other}, so check every line.`}
       {charges &&
         (charges.other === null
-          ? ` The charges (VAT, delivery or a discount) could not be read again on their own to confirm them${chargeRows ? ", so they are marked in orange" : ""}.`
-          : ` The charges (VAT, delivery or a discount) came to ${naira(charges.shown, "₦0")} in one read and ${naira(charges.other, "₦0")} in another${chargeRows ? "; they are marked in orange" : ""}.`)}
-      {charges && chargeRows && invoice.total !== null && ` Without them, the lines come to ${naira(linesTotal(invoice))} and the total says ${naira(invoice.total)}.`}
+          ? " Snap could not look for VAT, delivery or a discount on their own, so check the paper for any that is not listed here."
+          : chargeRows
+            ? ` ${unsure.map((c) => `${c.label} ${naira(c.amount)}`).join(" and ")} ${unsure.length === 1 ? "was" : "were"} found by only one read (marked in orange). With ${unsure.length === 1 ? "it" : "them"}, the invoice adds up${invoice.total !== null ? `; without, the lines and other charges come to ${naira(linesTotal(invoice) + (invoice.charges ?? []).filter((c) => !c.unsure).reduce((t, c) => t + c.amount, 0))} and the total says ${naira(invoice.total)}` : ""}.`
+            : ` The charges (VAT, delivery or a discount) came to ${naira(charges.shown, "₦0")} in one read and ${naira(charges.other, "₦0")} in another.`)}
       {marked > 0 && ` ${marked === 1 ? "The number they disagree on is" : `The ${marked} numbers they disagree on are`} marked in orange, with the other read beside ${marked === 1 ? "it" : "them"}.`}
     </div>
   );

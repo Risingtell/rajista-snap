@@ -68,6 +68,9 @@ describe("matchLine", () => {
     const asciiOnly = "lstores|carton peak tin 160g"; // saved on 16 Nov 2026, when accented letters were dropped
     expect(isAliasOf(asciiOnly, "Ọlá Stores", "Ctn Peak Tin 160g")).toBe(true);
     expect(isAliasOf(asciiOnly, "Ola Stores", "Ctn Peak Tin 160g")).toBe(false);
+    // A name with no letters a to z was saved with an empty supplier then: it never matches "no supplier" aliases.
+    expect(isAliasOf("|carton peak tin 160g", "محلات", "Ctn Peak Tin 160g")).toBe(false);
+    expect(isAliasOf("|carton peak tin 160g", null, "Ctn Peak Tin 160g")).toBe(true);
     const shop = [p("peak", "Peak Milk Tin 160g", [old])];
     expect(matchLine("Rising Technology", "Ctn Peak Tin 160g", shop).best?.how).toBe("learned");
   });

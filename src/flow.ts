@@ -1,16 +1,17 @@
 // What happens after the first cloud read, kept apart from Firebase so every path can be tested (src/flow.test.ts).
 //
-// The rule behind it: Snap only says an invoice does not add up when every number in the sum was found twice. Lines
-// and total come from two full reads. Charges (VAT, delivery, discounts) are the one kind of number a full read could
-// make up to close a gap, so they are checked against a narrow read of the charges alone, which is not asked to add
-// anything up. When the two disagree, nothing is blamed on the paper: the charges are marked for the owner to check.
+// The rule behind it: Snap only says an invoice does not add up when the lines and total were found twice, the charges
+// were read on their own, and no choice of the extra rows any read saw (VAT, delivery, deposits, discounts,
+// subtotals, payments) makes it add up. Which extra rows the total includes is decided by the arithmetic, not by their
+// labels. A row counts once two reads found it, or once the narrow charges read found it and it makes the sum work
+// (that read is not asked to add anything up, so it cannot close a gap on purpose). A sum that works only with a row
+// one read found is shown with that row marked for the owner to check, and nothing is blamed on the paper.
 //
-//   - A first read that adds up is kept (its charges, if any, confirmed by the narrow read).
-//   - Otherwise the quick model reads the photo again, with the charges read on their own at the same time. The same
-//     numbers twice: the paper itself does not add up. Same lines but a different total: a narrow read of the
-//     written total settles it. Different lines: the stronger model reads it too. Anything still unclear is shown
-//     with the disputed numbers marked.
-import { chargesTotal, checkSums, cleanCharges, reconcile, sameLines, settleTotal, totalOnlyDispute, type Charge, type Dispute, type Invoice } from "./invoice";
+//   - A first read that adds up without extra rows is kept; one that needs them gets the charges read on their own.
+//   - Otherwise the quick model reads the photo again, with the charges read on their own at the same time. Same
+//     lines and total: settled. Same lines, different totals: a narrow read of the written total settles it.
+//     Different lines: the stronger model reads it too. Anything still unclear is shown with the numbers marked.
+import { addingSubset, chargesTotal, checkSums, disputes, linesTotal, looksLikeCharge, naira, sameLines, type Charge, type Dispute, type Invoice } from "./invoice";
 
 export type Readers = {
   /** The whole invoice again, quick model. */
@@ -25,7 +26,7 @@ export type Readers = {
 
 export type Settled = {
   invoice: Invoice;
-  /** Only when every number in the sum was found twice and they do not add up. */
+  /** Only when the lines and total were found twice and no choice of the extra rows makes them add up. */
   paperError?: string;
   disputes?: Dispute[];
   /** One plain sentence per extra read, for the screen. */
@@ -41,34 +42,72 @@ export type SettleOptions = {
   why?: (e: unknown) => string;
 };
 
-/** How a full read's charges stand against the narrow read of the charges alone. */
-export type ChargeState = "none" | "confirmed" | "disputed" | "unchecked";
-export type Judged = { inv: Invoice; state: ChargeState };
+const PAPER_ADVICE =
+  " Check these numbers against the paper: if they match, the invoice itself does not add up, so check it with the supplier before you pay. (If the total includes VAT, delivery, a discount or an old balance that is not listed above, it may not be a mistake.)";
 
-/**
- * A full read's charges against the narrow read `n` (undefined: not read; null: that read failed).
- * - The narrow read's charges make this read add up: they are used. That read did not know the gap, so a made-up
- *   figure would not close it exactly.
- * - Both found the same charges, or both found none: confirmed.
- * - Otherwise disputed: the full read's own charges stay on screen for the owner to check.
- * - With no narrow read, charges the full read lists are unchecked.
- */
-export function judgeCharges(r: Invoice, n: Charge[] | null | undefined): Judged {
-  const own = r.charges ?? [];
-  if (!n) return { inv: r, state: own.length ? "unchecked" : "none" };
-  const nc = cleanCharges(r, n);
-  const narrow: Invoice = { ...r, charges: nc };
-  if (checkSums(narrow).ok) return { inv: narrow, state: nc.length ? "confirmed" : "none" };
-  if (Math.abs(chargesTotal(r) - chargesTotal(narrow)) <= 1) return own.length ? { inv: r, state: "confirmed" } : { inv: narrow, state: "none" };
-  return { inv: r, state: "disputed" };
+/** An extra row seen on the invoice, and which reads found it. */
+type Seen = { row: Charge; fulls: number; narrow: boolean };
+
+/** Every distinct extra row across the full reads and the narrow charges read, matched by amount (to the naira). */
+export function tally(fulls: Invoice[], narrow: Charge[] | null | undefined): Seen[] {
+  const seen: Seen[] = [];
+  const add = (rows: Charge[], mark: (s: Seen) => void) => {
+    const used = new Set<Seen>();
+    for (const row of rows) {
+      let s = seen.find((x) => !used.has(x) && Math.abs(x.row.amount - row.amount) <= 1);
+      if (!s) seen.push((s = { row: { label: row.label, amount: row.amount }, fulls: 0, narrow: false }));
+      used.add(s);
+      mark(s);
+    }
+  };
+  for (const f of fulls) add([...(f.charges ?? []), ...(f.notCounted ?? [])], (s) => s.fulls++);
+  add(narrow ?? [], (s) => (s.narrow = true));
+  return seen;
 }
 
-const settledCharges = (j: Judged) => j.state === "none" || j.state === "confirmed";
+export type Resolved = {
+  invoice: Invoice;
+  /** Some choice of the extra rows seen makes the total add up. */
+  adds: boolean;
+  /** Counted rows that only one full read found: the owner checks them. */
+  unsure: Charge[];
+};
+
+/**
+ * The shown lines and total, with the extra rows the total includes, weighed across every read. Tried in turn: rows
+ * found twice; then also rows only the narrow charges read found; then also rows only one full read found, which are
+ * marked unsure. When no choice adds up, the rows found twice that read like charges are shown.
+ */
+export function resolve(shown: Invoice, fulls: Invoice[], narrow: Charge[] | null | undefined): Resolved {
+  if (shown.total === null || shown.items.length === 0) return { invoice: shown, adds: true, unsure: [] };
+  const seen = tally(fulls, narrow);
+  const twice = seen.filter((s) => s.fulls + (s.narrow ? 1 : 0) >= 2).map((s) => s.row);
+  const narrowOnly = seen.filter((s) => s.narrow && s.fulls === 0).map((s) => s.row);
+  const all = seen.map((s) => s.row);
+  const make = (counted: Charge[], adds: boolean, unsure: Charge[] = []): Resolved => ({
+    invoice: {
+      ...shown,
+      charges: counted.map((r) => (unsure.includes(r) ? { ...r, unsure: true as const } : r)),
+      notCounted: all.filter((r) => !counted.includes(r)),
+    },
+    adds,
+    unsure,
+  });
+  const lines = linesTotal(shown);
+  const first = addingSubset(lines, shown.total, twice) ?? addingSubset(lines, shown.total, [...twice, ...narrowOnly]);
+  if (first) return make(first, true);
+  const any = addingSubset(lines, shown.total, all);
+  if (any) return make(any, true, any.filter((r) => !twice.includes(r) && !narrowOnly.includes(r)));
+  return make(
+    twice.filter((r) => looksLikeCharge(r.label)),
+    false,
+  );
+}
 
 export async function settle(first: Invoice, read: Readers, opts: SettleOptions = {}): Promise<Settled> {
   const why = opts.why ?? (() => "it failed");
   const steps: string[] = [];
-  const listed = (first.charges ?? []).length > 0;
+  const fulls: Invoice[] = [first];
 
   // The charges read on their own, once per photo: undefined until read, null if that read failed.
   let n: Charge[] | null | undefined;
@@ -85,85 +124,105 @@ export async function settle(first: Invoice, read: Readers, opts: SettleOptions 
       },
     ));
 
-  /** The result. Unless every read's charges are settled, the paper is not blamed and the charges are marked. */
-  const done = (invoice: Invoice, found: { paperError?: string; disputes?: Dispute[] }, reads: Judged[]): Settled => {
-    const disputes = [...(found.disputes ?? [])];
-    let paperError = found.paperError;
-    if (!reads.every(settledCharges)) {
-      paperError = undefined;
-      if (!disputes.some((d) => d.field === "charges")) {
-        const other = n ? chargesTotal({ ...invoice, charges: cleanCharges(invoice, n) }) : null;
-        disputes.push({ line: null, field: "charges", shown: chargesTotal(invoice), other });
+  /** The answer for the shown lines and total, with every read's extra rows weighed. */
+  const finish = (shown: Invoice, how: { twice: boolean; totalAgain?: boolean; disputes?: Dispute[] }): Settled => {
+    const r = resolve(shown, fulls, n);
+    const check = checkSums(r.invoice);
+    const out = [...(how.disputes ?? [])];
+    let paperError: string | undefined;
+    if (r.unsure.length) {
+      const total = chargesTotal(r.invoice);
+      out.push({ line: null, field: "charges", shown: total, other: total - r.unsure.reduce((t, c) => t + c.amount, 0) });
+    } else if (!check.ok && how.twice && !out.length) {
+      if (!r.adds && n === null) {
+        // The charges could not be looked for on their own, so a VAT or delivery line both reads missed cannot be
+        // ruled out: the owner checks, and the paper is not blamed.
+        out.push({ line: null, field: "charges", shown: chargesTotal(r.invoice), other: null });
+      } else {
+        const twiceSaid = how.totalAgain
+          ? `The total was read again on its own and came back as ${naira(shown.total)} again.`
+          : "Snap read the photo twice and got the same numbers both times.";
+        paperError = `${check.problems.join(" ")} ${twiceSaid}${PAPER_ADVICE}`;
       }
     }
-    return { invoice, paperError, disputes: disputes.length ? disputes : undefined, steps };
+    return { invoice: r.invoice, paperError, disputes: out.length ? out : undefined, steps };
   };
 
-  // 1. The first read. Charges it lists are checked against a read of the charges alone.
-  if (listed) {
+  const names = (x: Invoice, other: Invoice): Invoice => ({ ...x, supplier: x.supplier ?? other.supplier });
+  const problems = (x: Invoice) => checkSums(resolve(x, fulls, n).invoice).problems.length;
+  /** The read to show when two reads differ: fewer problems; on a tie, the later (or stronger) one. An empty read never replaces one with lines. */
+  const pick = (a: Invoice, b: Invoice) => (b.items.length === 0 && a.items.length > 0 ? a : problems(b) <= problems(a) ? b : a);
+  const lineDisputes = (shown: Invoice, other: Invoice) => disputes(shown, other).filter((d) => d.field !== "charges");
+
+  // 1. The first read. If it adds up only with extra rows it alone found, the charges are read on their own.
+  let r = resolve(first, fulls, n);
+  if (r.unsure.length) {
     await readCharges();
     steps.push(
       n === null
         ? `The read listed charges (VAT, delivery or a discount), but reading them on their own failed (${nFailed}).`
         : "The read listed charges (VAT, delivery or a discount), so the charges were read again on their own.",
     );
+    r = resolve(first, fulls, n);
   }
-  let a = judgeCharges(first, n);
-  const firstCheck = checkSums(a.inv);
-  if (opts.secondRead === false || (firstCheck.ok && a.state !== "disputed" && !opts.forceSecond)) return done(a.inv, {}, [a]);
+  const firstCheck = checkSums(r.invoice);
+  if (opts.secondRead === false || (firstCheck.ok && !r.unsure.length && !opts.forceSecond)) return finish(first, { twice: false });
 
-  // 2. The quick model reads the photo again. Unless already done, the charges are read on their own at the same
-  //    time, so a VAT or delivery line that both full reads missed is not taken for the supplier's mistake.
+  // 2. The quick model reads the photo again; the charges are read on their own at the same time (unless done), so a
+  //    VAT or delivery line that both full reads missed is not taken for the supplier's mistake.
   steps.push(
     !firstCheck.ok
       ? `The first cloud read did not add up (${firstCheck.problems[0]}), so it was read a second time.`
-      : a.state === "disputed"
-        ? "Read on their own, the charges came out different, so it was read a second time."
+      : r.unsure.length
+        ? "Its charges could not be confirmed, so it was read a second time."
         : "It was read a second time (test mode).",
   );
   const chargesNow = n === undefined;
   const [again] = await Promise.all([
     read.again().then(
-      (inv) => ({ inv, failed: "" }),
-      (e) => ({ inv: null, failed: why(e) }),
+      (inv) => ({ inv: inv as Invoice | null, failed: "" }),
+      (e) => ({ inv: null as Invoice | null, failed: why(e) }),
     ),
     readCharges(),
   ]);
   if (chargesNow) {
     steps.push(n === null ? `Reading VAT, delivery and discounts on their own failed (${nFailed}).` : "VAT, delivery and discounts were also read on their own.");
   }
-  a = judgeCharges(first, n);
   if (!again.inv) {
     steps.push(`The second read failed (${again.failed}), so the first read is shown: please check it against the paper.`);
-    return done(a.inv, {}, [a]);
+    return finish(first, { twice: false });
   }
-  let b = judgeCharges(again.inv, n);
-  // When one full read agrees with the charges read on their own, the other full read's charges were the odd ones out.
-  if (a.state === "disputed" && settledCharges(b)) a = { inv: { ...a.inv, charges: b.inv.charges }, state: b.state };
-  else if (b.state === "disputed" && settledCharges(a)) b = { inv: { ...b.inv, charges: a.inv.charges }, state: a.state };
+  const second = again.inv;
+  fulls.push(second);
 
-  if (totalOnlyDispute(a.inv, b.inv)) {
-    // Same lines and charges, different totals, one of them adds up: read just the written total once more.
+  // Same lines and total twice: settled (the extra rows are weighed in finish).
+  if (sameLines(first, second) && first.total === second.total) return finish(names(second, first), { twice: true });
+
+  if (sameLines(first, second)) {
+    // Same lines, different totals: read just the written total once more.
     try {
-      const s = settleTotal(a.inv, b.inv, await read.total());
-      return done(s.invoice, s, [a, b]);
+      const written = await read.total();
+      if (written !== null && (written === first.total || written === second.total)) {
+        return finish({ ...names(second, first), total: written }, { twice: true, totalAgain: true });
+      }
     } catch {
-      /* the narrow read failed: fall through, and the owner checks the disputed total */
+      /* the narrow read failed: the owner checks the disputed total */
     }
+    const shown = pick(first, second);
+    return finish(shown, { twice: false, disputes: lineDisputes(shown, shown === second ? first : second) });
   }
 
-  if (!sameLines(a.inv, b.inv)) {
-    // The two quick reads disagree on the lines themselves: the stronger model gives a third opinion.
-    steps.push("The two reads disagreed on the lines, so a stronger model read it too.");
-    try {
-      const c = judgeCharges(await read.strong(), n);
-      const better = checkSums(b.inv).problems.length < checkSums(a.inv).problems.length ? b : a;
-      const r = reconcile(better.inv, c.inv);
-      return done(r.invoice, r, [better, c]);
-    } catch (e) {
-      steps.push(`The stronger model could not help (${why(e)}).`);
-    }
+  // Different lines: the stronger model gives a third opinion.
+  steps.push("The two reads disagreed on the lines, so a stronger model read it too.");
+  const better = pick(first, second);
+  try {
+    const third = await read.strong();
+    fulls.push(third);
+    if (sameLines(better, third) && better.total === third.total) return finish(names(third, better), { twice: true });
+    const shown = pick(better, third);
+    return finish(shown, { twice: false, disputes: lineDisputes(shown, shown === third ? better : third) });
+  } catch (e) {
+    steps.push(`The stronger model could not help (${why(e)}).`);
   }
-  const r = reconcile(a.inv, b.inv);
-  return done(r.invoice, r, [a, b]);
+  return finish(better, { twice: false, disputes: lineDisputes(better, better === second ? first : second) });
 }

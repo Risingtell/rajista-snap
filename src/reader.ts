@@ -76,8 +76,9 @@ const lm = (): LM | undefined => (globalThis as unknown as { LanguageModel?: LM 
 export type DeviceStatus = "unsupported" | "unavailable" | "downloadable" | "downloading" | "available";
 const IMAGE_INPUT = { expectedInputs: [{ type: "image" }] };
 
-/** Set when an on-device reading ran past its time limit: the rest of this visit reads in the cloud. */
+/** Set when an on-device reading ran past its time limit (or the device stayed busy twice): the rest of this visit reads in the cloud. */
 let slow = false;
+let busyTimes = 0;
 export const deviceSlow = () => slow;
 
 export async function deviceStatus(): Promise<DeviceStatus> {
@@ -299,6 +300,7 @@ export async function readInvoice(photo: Photo, onStep: (step: "device" | "cloud
             : "The on-device read had nothing to check its prices against (no invoice total to match), so the cloud read it.";
     } catch (e) {
       if (/no answer after/.test(message(e))) slow = true;
+      if (/device busy/.test(message(e)) && ++busyTimes >= 2) slow = true; // Chrome is not letting go: stop waiting on it
       device = { ms: Math.round(performance.now() - t), error: message(e) };
       whyCloud = slow
         ? "The on-device model took too long, so the cloud read it."

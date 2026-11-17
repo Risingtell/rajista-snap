@@ -31,6 +31,8 @@ export function onDevice<T>(job: (signal: AbortSignal) => Promise<T>, kind: Devi
     if (kind === "read") readsWaiting--;
     else if (readsWaiting > 0) throw new Error("A reading is waiting for the on-device model.");
     if (releasing && !(await Promise.race([releasing.then(() => true as const), after(releaseMs)]))) throw new Error("device busy");
+    // A reading may have arrived while this match waited for Chrome: readings come first.
+    if (kind === "pick" && readsWaiting > 0) throw new Error("A reading is waiting for the on-device model.");
     const stop = new AbortController();
     const work = job(stop.signal);
     running = { kind, stop };

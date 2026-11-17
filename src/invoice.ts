@@ -8,10 +8,19 @@ export type Line = {
   line_total: number | null; // naira
 };
 
-/** An amount that is part of the total but is not a product: VAT, delivery, transport, or a discount (negative). */
-export type Charge = { label: string; amount: number };
+/** An amount on the paper that is not a product: VAT, delivery, transport, a deposit, or a discount (negative). */
+export type Charge = {
+  label: string;
+  amount: number;
+  /** Found by only one read: the total adds up only if this row is really on the paper, so the owner checks it. */
+  unsure?: true;
+};
 
-export type Invoice = { supplier: string | null; items: Line[]; total: number | null; charges?: Charge[] };
+/**
+ * `charges`: the extra rows the total includes. `notCounted`: rows seen but not part of the sum (a subtotal, a
+ * payment, a balance), kept so the reads can be weighed against each other.
+ */
+export type Invoice = { supplier: string | null; items: Line[]; total: number | null; charges?: Charge[]; notCounted?: Charge[] };
 
 /** The JSON shape both readers are asked for. Written once so the device and the cloud get the same contract. */
 export const INVOICE_JSON_SCHEMA = {
@@ -91,15 +100,17 @@ const num = (v: unknown): number | null => {
   return null;
 };
 
-// Readers sometimes copy a subtotal, the total, a payment or a balance into the charges (seen on 16 Nov 2026 with a
-// printed VAT invoice: "SUBTOTAL 160,000" next to "VAT 7.5% 12,000"). Those are sums or payments, not charges.
+// A row's label is only a hint. Readers copy subtotals, totals, payments and balances among the charges (seen on 16
+// Nov 2026: "SUBTOTAL 160,000" next to "VAT 7.5% 12,000"), and the same word can mean either ("Crate deposit" is a
+// charge, "Less: Deposit" a payment). So the arithmetic decides which rows the total includes (addingSubset); the
+// label only breaks ties, and picks what to show when nothing adds up.
 const PAYMENT = /\b(deposit|advance|balance|bal|b\/f|c\/f|brought\s+forward|carried\s+forward|paid|payments?|amount\s+(due|payable))\b/i;
 const MONEY_HANDED = /\b(cash|change)\b/i;
 const SUMMARY = /\b(sub[\s-]*total|grand[\s-]*total|net[\s-]*total|total)\b/gi;
 const A_CHARGE = /vat|tax|levy|deliver|transport|freight|carriage|loading|discount|rebate|commission|surcharge|fee|charge/i;
 
-/** Whether a row's label names a charge (VAT, delivery, a discount) rather than a sum, a payment or a balance. */
-export function isChargeLabel(label: string): boolean {
+/** Whether a row's label reads like a charge (VAT, delivery, a discount) rather than a sum, a payment or a balance. */
+export function looksLikeCharge(label: string): boolean {
   if (PAYMENT.test(label)) return false; // "Less: Deposit", "Advance paid", "Previous balance", "Bal b/f"
   const rest = label.replace(SUMMARY, " ");
   if (rest !== label && !A_CHARGE.test(rest)) return false; // "Subtotal", "Grand total"; but "Total VAT" is VAT
@@ -107,7 +118,7 @@ export function isChargeLabel(label: string): boolean {
   return true;
 }
 
-/** The charges in whatever a model returned: labelled, non-zero amounts that are not a subtotal, total or payment. */
+/** Every extra row in whatever a model returned: labelled, non-zero amounts. Which ones count is decided later. */
 export function chargesFrom(raw: unknown): Charge[] {
   const o = (typeof raw === "string" ? JSON.parse(raw) : raw) as { charges?: unknown } | null;
   return (Array.isArray(o?.charges) ? o.charges : [])
@@ -115,25 +126,36 @@ export function chargesFrom(raw: unknown): Charge[] {
       const r = (c ?? {}) as Record<string, unknown>;
       return { label: String(r.label ?? "").replace(/\s+/g, " ").trim() || "Charge", amount: num(r.amount) };
     })
-    .filter((c): c is Charge => c.amount !== null && c.amount !== 0 && isChargeLabel(c.label));
+    .filter((c): c is Charge => c.amount !== null && c.amount !== 0);
 }
 
 /** The sum of the line totals (a line with no total counts as quantity × unit price, if it has one). */
 export const linesTotal = (inv: Pick<Invoice, "items">) =>
   inv.items.reduce((s, l) => s + (l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : 0)), 0);
 
+const MAX_ROWS = 10;
 /**
- * The charges that really are charges for this read. An amount equal to the lines' sum or to the total is that sum
- * or total copied as a charge ("Amount excl. VAT", "Total incl. VAT"), and an amount under a "total" label equal to
- * the other charges together is a summary of them ("Total charges"). Applied to every read, full or narrow.
+ * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. When several
+ * choices work, the one with the most rows that read like charges, and the fewest that read like sums or payments,
+ * wins; then the one with fewer rows.
  */
-export function cleanCharges(inv: Pick<Invoice, "items" | "total">, charges: Charge[]): Charge[] {
-  const near = (a: number, b: number) => Math.abs(a - b) <= 1;
-  const sum = linesTotal(inv);
-  const kept = charges.filter((c) => !(sum > 0 && near(c.amount, sum)) && !(inv.total !== null && inv.total !== 0 && near(c.amount, inv.total)));
-  return kept.filter(
-    (c, i) => !(kept.length > 1 && /\btotal\b/i.test(c.label) && near(c.amount, kept.reduce((t, x, j) => (j === i ? t : t + x.amount), 0))),
-  );
+export function addingSubset(lines: number, total: number, rows: Charge[]): Charge[] | null {
+  const k = Math.min(rows.length, MAX_ROWS);
+  let best: { set: Charge[]; score: number } | null = null;
+  for (let mask = 0; mask < 1 << k; mask++) {
+    const set = rows.slice(0, k).filter((_, i) => (mask >> i) & 1);
+    if (Math.abs(lines + set.reduce((t, r) => t + r.amount, 0) - total) > 1) continue;
+    const score = set.reduce((t, r) => t + (looksLikeCharge(r.label) ? 100 : -200), 0) - set.length;
+    if (!best || score > best.score) best = { set, score };
+  }
+  return best ? best.set : null;
+}
+
+/** One read's extra rows, split into those its total includes and the rest, as far as one read can tell. */
+export function arrange(inv: Invoice, rows: Charge[]): Invoice {
+  const set = inv.total !== null && inv.items.length ? addingSubset(linesTotal(inv), inv.total, rows) : null;
+  const counted = set ?? rows.filter((r) => looksLikeCharge(r.label));
+  return { ...inv, charges: counted, notCounted: rows.filter((r) => !counted.includes(r)) };
 }
 
 /** Turns whatever a model returned into a clean Invoice, or throws if it is not one. */
@@ -152,9 +174,8 @@ export function normalize(raw: unknown): Invoice {
     })
     .filter((l) => l.description);
   const total = num(o.total);
-  const charges = cleanCharges({ items, total }, chargesFrom(o));
   const supplier = typeof o.supplier === "string" && o.supplier.trim() ? o.supplier.replace(/\s+/g, " ").trim() : null;
-  return { supplier, items, charges, total };
+  return arrange({ supplier, items, total }, chargesFrom(o));
 }
 
 export type Check = {
@@ -167,7 +188,7 @@ export type Check = {
    */
   notes: string[];
   hasPrices: boolean;
-  /** The read lists charges (VAT, delivery, discounts). They are only trusted once read on their own (src/flow.ts). */
+  /** The total includes extra rows (VAT, delivery, discounts). They are only trusted once another read finds them. */
   hasCharges: boolean;
   /**
    * True only when another number on the page confirms the prices: every line has a total and the lines
@@ -186,10 +207,12 @@ export const chargesTotal = (inv: Invoice) => (inv.charges ?? []).reduce((s, c) 
 // real ₦2,000 adding error on a ₦2.4 million invoice is caught. A line's quantity × unit price must also match its
 // total to within ₦1, except where rounding can explain the gap. A per-piece price is often rounded to the naira (a
 // carton of 12 for ₦13,000 is ₦1,083.33 a piece, written ₦1,083), and so may the line total be, so a gap of up to
-// half a naira per piece, plus half a naira, is shown to the owner as a note to check. It never fails the check (a
-// false "does not add up" would blame an honest supplier) and never reads as "all clear". A bigger gap fails.
+// half a naira per piece, plus half a naira, is shown to the owner as a note to check. (A unit price written with
+// kobo was not rounded to the naira, so it gets half a kobo per piece.) It never fails the check (a false "does not
+// add up" would blame an honest supplier) and never reads as "all clear". A bigger gap fails.
 const closeTotal = (a: number, b: number) => Math.abs(a - b) <= 1;
-const roundingCovers = (quantity: number, gap: number) => Math.abs(gap) <= 0.5 * quantity + 0.5;
+const roundingCovers = (quantity: number, unit: number, gap: number) =>
+  Math.abs(gap) <= (Number.isInteger(unit) ? 0.5 : 0.005) * quantity + 0.5;
 
 /**
  * Does the invoice add up? Quantity x unit price must equal each line total, and the lines plus any charges must
@@ -208,9 +231,9 @@ export function checkSums(inv: Invoice): Check {
       const product = l.quantity * l.unit_price;
       const gap = l.line_total - product;
       if (Math.abs(gap) > 1) {
-        if (roundingCovers(l.quantity, gap)) {
+        if (roundingCovers(l.quantity, l.unit_price, gap)) {
           notes.push(
-            `Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, but the line says ${naira(l.line_total)} (${naira(Math.abs(gap))} ${gap > 0 ? "more" : "less"}). A rounded unit price can explain that much; check the line total against the paper.`,
+            `Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, but the line says ${naira(l.line_total)} (${naira(Math.abs(gap))} ${gap > 0 ? "more" : "less"}). A rounded unit price could explain that much, but check the line total against the paper before you pay.`,
           );
         } else {
           problems.push(`Line ${i + 1}: ${l.quantity} × ${naira(l.unit_price)} is ${naira(product)}, not ${naira(l.line_total)}.`);
@@ -239,9 +262,9 @@ export function checkSums(inv: Invoice): Check {
 
 /**
  * Whether an on-device read can be kept without asking the cloud: it adds up with nothing to note, it has prices,
- * another number on the page confirms them, and it lists no charges. A read with no prices is not trusted (the
- * device may simply have failed to read them), and neither is one that adds up only with charges: a reader could
- * invent a "discount" to close a gap, so charges are always read again on their own in the cloud.
+ * another number on the page confirms them, and its total needs no extra rows. A read with no prices is not trusted
+ * (the device may simply have failed to read them), and neither is one that adds up only with extra rows: a reader
+ * could invent a "discount" to close a gap, so such rows are always checked by another read, in the cloud.
  */
 export const trustDeviceRead = (c: Check) => c.ok && c.notes.length === 0 && c.hasPrices && c.crossChecked && !c.hasCharges;
 
@@ -255,9 +278,6 @@ export function sameLines(a: Invoice, b: Invoice): boolean {
     })
   );
 }
-
-/** True when two reads found every number the same: lines, charges and total. */
-export const sameNumbers = (a: Invoice, b: Invoice) => a.total === b.total && chargesTotal(a) === chargesTotal(b) && sameLines(a, b);
 
 /** One number two reads disagree on. `line` is the line's index, or null for the total, the charges or the line count. */
 export type Dispute = {
@@ -283,78 +303,4 @@ export function disputes(shown: Invoice, other: Invoice): Dispute[] {
   if (chargesTotal(shown) !== chargesTotal(other)) out.push({ line: null, field: "charges", shown: chargesTotal(shown), other: chargesTotal(other) });
   if (shown.total !== other.total) out.push({ line: null, field: "total", shown: shown.total, other: other.total });
   return out;
-}
-
-export type Reconciled = {
-  invoice: Invoice;
-  /** Only when the paper's own numbers were confirmed and they do not add up. */
-  paperError?: string;
-  /** The numbers the two reads disagree on, for the owner to check against the paper. */
-  disputes: Dispute[];
-};
-
-const PAPER_ADVICE =
-  " Check these numbers against the paper: if they match, the invoice itself does not add up, so check it with the supplier before you pay. (If the total includes VAT, delivery, a discount or an old balance that is not listed above, it may not be a mistake.)";
-
-/**
- * Combines a first read that did not add up with a second read of the same photo (charges already settled).
- *
- * - Same numbers in both: both readers saw the same thing, so if it does not add up, the paper itself is wrong.
- *   The second (stronger) read's names and supplier are kept, with the shared numbers.
- * - Different numbers: neither read is confirmed. Show the read that adds up (or has clearly fewer problems), and
- *   list every number they disagree on. Never claim the paper is wrong here: one reader may simply have misread it,
- *   or may have "corrected" the paper's arithmetic. On a tie the second (later, or stronger) read is shown, but an
- *   empty read never replaces one that found lines.
- */
-export function reconcile(first: Invoice, second: Invoice): Reconciled {
-  const a = checkSums(first);
-  const b = checkSums(second);
-  if (sameNumbers(first, second)) {
-    return {
-      invoice: { ...second, supplier: second.supplier ?? first.supplier },
-      disputes: [],
-      paperError: a.ok ? undefined : `${a.problems.join(" ")} Snap read the photo twice and got the same numbers both times.${PAPER_ADVICE}`,
-    };
-  }
-  const secondEmpty = second.items.length === 0 && first.items.length > 0;
-  const useSecond = !secondEmpty && (b.ok || (!a.ok && b.problems.length <= a.problems.length));
-  const shown = useSecond ? second : first;
-  const other = useSecond ? first : second;
-  return { invoice: { ...shown, supplier: shown.supplier ?? other.supplier }, disputes: disputes(shown, other) };
-}
-
-/**
- * True when two reads agree on every line and charge but not on the total, and exactly one of them adds up. Then one
- * reader either misread the total or "corrected" the paper's sum, and a narrow look at the written total settles it.
- */
-export function totalOnlyDispute(first: Invoice, second: Invoice): boolean {
-  return (
-    first.total !== second.total &&
-    sameLines(first, second) &&
-    chargesTotal(first) === chargesTotal(second) &&
-    checkSums(first).ok !== checkSums(second).ok
-  );
-}
-
-/**
- * Settles a total-only dispute with the total as written, read on its own a third time.
- * - It matches the read that does not add up: the paper says that, so the paper's sum is wrong.
- * - It matches the read that adds up: the other reader misread the total.
- * - Anything else: still unclear, so the owner checks the disputed total.
- */
-export function settleTotal(first: Invoice, second: Invoice, written: number | null): Reconciled {
-  const failing = checkSums(first).ok ? second : first;
-  const passing = failing === first ? second : first;
-  // Keep the stronger (second) read's names and supplier in every case; only the total is in question.
-  const names = { ...second, supplier: second.supplier ?? first.supplier };
-  if (written !== null && written === failing.total) {
-    const invoice = { ...names, total: failing.total };
-    return {
-      invoice,
-      disputes: [],
-      paperError: `${checkSums(invoice).problems.join(" ")} The total was read again on its own and came back as ${naira(failing.total)} again.${PAPER_ADVICE}`,
-    };
-  }
-  if (written !== null && written === passing.total) return { invoice: { ...names, total: passing.total }, disputes: [] };
-  return reconcile(first, second);
 }
