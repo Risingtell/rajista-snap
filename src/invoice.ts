@@ -33,7 +33,7 @@ export const INVOICE_JSON_SCHEMA = {
       items: {
         type: "object",
         properties: {
-          quantity: { type: "number" },
+          quantity: { type: ["number", "null"] },
           description: { type: "string" },
           unit_price: { type: ["number", "null"] },
           line_total: { type: ["number", "null"] },
@@ -58,7 +58,7 @@ export const INVOICE_JSON_SCHEMA = {
 export const READ_PROMPT =
   "This is a photo of a Nigerian shop invoice, receipt or delivery note. It may be handwritten, and the photo may be " +
   "sideways or upside down: read it the right way up. " +
-  "List every product line: quantity, the product description copied exactly as written (join a description that runs over " +
+  "List every product line: quantity (null if no quantity is written), the product description copied exactly as written (join a description that runs over " +
   "several lines; do not expand abbreviations, explain or add words), " +
   "unit price in naira and line total in naira. Use null for a price that is not written. " +
   "List in charges every other amount written on the paper with its own figure, apart from the grand total: VAT, " +
@@ -136,74 +136,66 @@ export function chargesFrom(raw: unknown): Charge[] {
 export const linesTotal = (inv: Pick<Invoice, "items">) =>
   inv.items.reduce((s, l) => s + (l.line_total ?? (l.unit_price !== null ? l.quantity * l.unit_price : 0)), 0);
 
-/** At most this many extra rows are tried; beyond it the paper is never blamed (see src/flow.ts). */
+/** At most this many extra rows are tried. */
 export const MAX_ROWS = 12;
 
 /**
- * What kind of extra row a label names. Two reads' rows are the same row only if they are the same kind and amount,
- * and the kind, not the sign a reader wrote, decides how a row can count: a discount or payment always comes off, VAT
- * or delivery is always added, and a deposit can be either (a crate deposit is added; "less deposit" is taken off).
+ * Whether a row's label says it goes the other way from how it was counted: a discount added to the total, or VAT or
+ * delivery taken off it. Labels are only hints, so this can only make Snap more careful (an orange "check this"
+ * instead of "all clear"), never blame a supplier and never clear an invoice.
  */
-export type RowKind = "tax" | "off" | "deposit" | "paid" | "carriage" | "balance" | "sum" | "fee" | "other";
-export function rowKind(label: string): RowKind {
-  const l = label.toLowerCase();
-  if (/vat|tax|levy/.test(l)) return "tax";
-  if (/discount|rebate|\bless\b|credit|refund/.test(l)) return "off";
-  if (/deposit/.test(l)) return "deposit";
-  if (/paid|payment|advance|\bcash\b|\bchange\b/.test(l)) return "paid";
-  if (/deliver|transport|freight|carriage|loading/.test(l)) return "carriage";
-  if (/balance|\bbal\b|b\/f|c\/f|forward/.test(l)) return "balance";
-  if (/total/.test(l)) return "sum";
-  if (/fee|commission|surcharge|charge/.test(l)) return "fee";
-  return "other";
+export function doubtfulSign(row: Charge): boolean {
+  if (row.amount > 0) return /discount|rebate|\bless\b/i.test(row.label);
+  return /\bv\.?\s?a\.?\s?t\b|deliver|transport/i.test(row.label);
 }
 
-/** The amounts a row can add to the total: taken off, added, either, or (a row of unknown kind) as written. */
-export function rowAmounts(r: Charge): number[] {
-  const a = Math.abs(r.amount);
-  switch (rowKind(r.label)) {
-    case "off":
-    case "paid":
-      return [-a];
-    case "deposit":
-      return [a, -a];
-    case "tax":
-    case "carriage":
-    case "fee":
-      return [a];
-    default:
-      return [r.amount];
-  }
+const TAKES_OFF = /discount|rebate|\bless\b/i;
+const ADDS_ON = /\bv\.?\s?a\.?\s?t\b|tax|levy|deliver|transport|fee|charge/i;
+/**
+ * Whether two labels clearly name opposite things (a discount against VAT, delivery or a fee). Rows like that are
+ * never taken for the same row, even at the same amount, so one read's delivery line never vouches for another
+ * read's discount. Labels only ever stop such a match; they never make one.
+ */
+export const opposedLabels = (a: string, b: string) => (TAKES_OFF.test(a) && ADDS_ON.test(b)) || (ADDS_ON.test(a) && TAKES_OFF.test(b));
+
+/**
+ * A row that only repeats the total or the lines' sum ("Total 109,000", "Subtotal 109,500", "Balance" equal to the
+ * total when nothing was paid). It adds no information, so it does not count as another amount on the paper.
+ */
+export function isEcho(row: Charge, lines: number, total: number | null): boolean {
+  const near = (x: number) => Math.abs(Math.abs(row.amount) - x) <= 1;
+  if (total !== null && near(total) && /total|balance|amount due|to pay/i.test(row.label)) return true;
+  return lines > 0 && near(lines) && /sub/i.test(row.label);
 }
 
 /**
  * The extra rows that make lines + rows = total, to the naira, or null if no choice of them does. Each row is left
- * out or counted in one of the ways its kind allows (rowAmounts), and returned with the amount it counts for. When
- * several choices work, the one with the most rows that read like charges, and the fewest that read like sums or
- * payments, wins; then the one with fewer rows.
+ * out, counted as written, or counted with its sign turned (a discount written without a minus sign). When several
+ * choices work, the one with the most rows that read like charges, and the fewest that read like sums or payments,
+ * wins; then the one that turns fewer signs; then the one with fewer rows.
  */
-export function addingSubset(lines: number, total: number, rows: Charge[]): Charge[] | null {
+export function addingSubset<T extends Charge>(lines: number, total: number, rows: T[]): T[] | null {
   // Worked out once per row, not at every step of the search.
   const list = rows.slice(0, MAX_ROWS).map((r) => ({
     r,
-    amounts: rowAmounts(r),
     // A charge-like row counts for; a "total" label (a summary of others) slightly less; a sum or payment against.
     weight: looksLikeCharge(r.label) ? (/total/i.test(r.label) ? 99 : 100) : -200,
   }));
-  const found: { best: { set: Charge[]; score: number } | null } = { best: null };
-  const set: Charge[] = [];
+  const found: { best: { set: T[]; score: number } | null } = { best: null };
+  const set: T[] = [];
   const walk = (i: number, sum: number, score: number) => {
     if (i === list.length) {
       const s = score - set.length;
       if (Math.abs(lines + sum - total) <= 1 && (!found.best || s > found.best.score)) found.best = { set: [...set], score: s };
       return;
     }
-    const { r, amounts, weight } = list[i];
-    for (const amount of amounts) {
-      set.push(amount === r.amount ? r : { ...r, amount });
-      walk(i + 1, sum + amount, score + weight);
-      set.pop();
-    }
+    const { r, weight } = list[i];
+    set.push(r);
+    walk(i + 1, sum + r.amount, score + weight);
+    set.pop();
+    set.push({ ...r, amount: -r.amount });
+    walk(i + 1, sum - r.amount, score + weight - 10);
+    set.pop();
     walk(i + 1, sum, score); // left out
   };
   walk(0, 0, 0);

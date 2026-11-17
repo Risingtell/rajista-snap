@@ -139,7 +139,15 @@ export function App() {
 
   function edit(i: number, patch: Partial<Line>) {
     if (!invoice) return;
-    setInvoice({ ...invoice, items: invoice.items.map((l, k) => (k === i ? { ...l, ...patch } : l)) });
+    setInvoice({
+      ...invoice,
+      items: invoice.items.map((l, k) => {
+        if (k !== i) return l;
+        const next = { ...l, ...patch };
+        if ("quantity" in patch) delete next.guessed;
+        return next;
+      }),
+    });
     setSaved(null);
   }
 
@@ -427,7 +435,11 @@ export function App() {
                   ? check.problems.join(" ")
                   : !check.hasPrices
                     ? "No prices on this paper."
-                    : reading.disputes
+                    : !check.crossChecked
+                      ? invoice.total === null
+                        ? "No total on this paper to check the prices against."
+                        : "Some lines have no price, so the total could not be checked."
+                      : reading.disputes
                       ? reading.disputes.some((d) => d.field !== "lines" && d.field !== "charges")
                         ? "Adds up as shown, but check the numbers marked in orange against the paper."
                         : reading.disputes.some((d) => d.field === "lines")
@@ -435,11 +447,7 @@ export function App() {
                           : "Adds up as shown, but check the charges (VAT, delivery or a discount) against the paper."
                       : check.notes.length
                         ? "Adds up, but check the note below."
-                        : !check.crossChecked
-                          ? invoice.total === null
-                            ? "No total on this paper to check the prices against."
-                            : "Some lines have no price, so the total could not be checked."
-                          : "✓ Everything adds up."}
+                        : "✓ Everything adds up."}
               </p>
               {check.notes.length > 0 && <p className="notes">{check.notes.join(" ")}</p>}
               <div className="actions">

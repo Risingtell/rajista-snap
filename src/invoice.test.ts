@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { addingSubset, arrange, rowAmounts, rowKind, CHARGES_PROMPT, chargesFrom, checkSums, disputes, looksLikeCharge, naira, normalize, sameLines, trustDeviceRead } from "./invoice";
+import {
+  addingSubset,
+  arrange,
+  CHARGES_PROMPT,
+  chargesFrom,
+  checkSums,
+  disputes,
+  doubtfulSign,
+  INVOICE_JSON_SCHEMA,
+  isEcho,
+  looksLikeCharge,
+  naira,
+  normalize,
+  opposedLabels,
+  READ_PROMPT,
+  sameLines,
+  trustDeviceRead,
+} from "./invoice";
 
 // The three real invoices from the first test (14 Nov 2026), as each reader returned them.
 const cloudRising = {
@@ -228,32 +245,48 @@ describe("extra rows (VAT, delivery, deposits, subtotals, payments)", () => {
   });
 });
 
-describe("row kinds", () => {
-  it("decide how a row can count, whatever sign a reader wrote", () => {
-    expect(rowKind("VAT 7.5%")).toBe("tax");
-    expect(rowKind("Total VAT")).toBe("tax");
-    expect(rowKind("Cash discount")).toBe("off");
-    expect(rowKind("Less: Deposit")).toBe("off");
-    expect(rowKind("Crate deposit")).toBe("deposit");
-    expect(rowKind("Amount paid")).toBe("paid");
-    expect(rowKind("Transport")).toBe("carriage");
-    expect(rowKind("Previous balance")).toBe("balance");
-    expect(rowKind("SUBTOTAL")).toBe("sum");
-    expect(rowAmounts({ label: "Discount", amount: 3000 })).toEqual([-3000]);
-    expect(rowAmounts({ label: "VAT", amount: -12000 })).toEqual([12000]);
-    expect(rowAmounts({ label: "Crate deposit", amount: -2000 })).toEqual([2000, -2000]);
-    expect(rowAmounts({ label: "Something", amount: -50 })).toEqual([-50]);
-  });
-
-  it("never adds a discount, and counts a deposit either way", () => {
-    expect(addingSubset(100000, 103000, [{ label: "Discount", amount: 3000 }])).toBeNull();
+describe("labels only ever add doubt", () => {
+  it("count every row as written or with its sign turned, whatever its label", () => {
+    // A discount written without a minus sign, and a crate deposit written with one.
     expect(addingSubset(100000, 97000, [{ label: "Discount", amount: 3000 }])).toEqual([{ label: "Discount", amount: -3000 }]);
     expect(addingSubset(50000, 52000, [{ label: "Crate deposit", amount: -2000 }])).toEqual([{ label: "Crate deposit", amount: 2000 }]);
-    expect(addingSubset(100000, 70000, [{ label: "Less deposit", amount: 30000 }])).toEqual([{ label: "Less deposit", amount: -30000 }]);
+    // Withholding tax and an unlabelled minus count as written.
+    expect(addingSubset(100000, 102500, [{ label: "VAT", amount: 7500 }, { label: "Withholding tax", amount: -5000 }])).toHaveLength(2);
+    expect(addingSubset(100000, 99500, [{ label: "Charge", amount: -500 }])).toEqual([{ label: "Charge", amount: -500 }]);
+  });
+
+  it("flag a row counted the other way from what its label says, for the owner to check", () => {
+    expect(doubtfulSign({ label: "Discount", amount: 3000 })).toBe(true);
+    expect(doubtfulSign({ label: "Discount", amount: -3000 })).toBe(false);
+    expect(doubtfulSign({ label: "V.A.T 7.5%", amount: -7500 })).toBe(true);
+    expect(doubtfulSign({ label: "Delivery", amount: -2000 })).toBe(true);
+    expect(doubtfulSign({ label: "Withholding tax", amount: -5000 })).toBe(false);
+    expect(doubtfulSign({ label: "Crate deposit", amount: 2000 })).toBe(false);
+  });
+
+  it("stop a match between rows that clearly name opposite things, and nothing else", () => {
+    expect(opposedLabels("Discount", "Delivery")).toBe(true);
+    expect(opposedLabels("Less", "VAT")).toBe(true);
+    expect(opposedLabels("V.A.T 7.5%", "VAT")).toBe(false);
+    expect(opposedLabels("Charge", "Discount")).toBe(true);
+    expect(opposedLabels("Crate deposit", "Deposit")).toBe(false);
+  });
+
+  it("know a row that only repeats the total or the lines' sum", () => {
+    expect(isEcho({ label: "Total", amount: 109000 }, 109500, 109000)).toBe(true);
+    expect(isEcho({ label: "Sub-total", amount: 109500 }, 109500, 109000)).toBe(true);
+    expect(isEcho({ label: "Balance", amount: 109000 }, 109500, 109000)).toBe(true);
+    expect(isEcho({ label: "Transport", amount: 5000 }, 5000, 10000)).toBe(false);
+    expect(isEcho({ label: "VAT", amount: 109000 }, 109500, 109000)).toBe(false);
   });
 });
 
 describe("a quantity nobody wrote", () => {
+  it("may be returned as null by both readers, who are told to", () => {
+    expect(INVOICE_JSON_SCHEMA.properties.items.items.properties.quantity.type).toEqual(["number", "null"]);
+    expect(READ_PROMPT).toMatch(/quantity \(null if no quantity is written\)/);
+  });
+
   it("is taken from the line when that gives whole pieces, noted, and never checked as an error", () => {
     const inferred = normalize({ items: [{ quantity: null, description: "Rice 50kg", unit_price: 25000, line_total: 75000 }], total: 75000 });
     expect(inferred.items[0]).toMatchObject({ quantity: 3, guessed: true });
